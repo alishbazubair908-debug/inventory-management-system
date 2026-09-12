@@ -1,0 +1,3914 @@
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <cstdint>
+#include <iomanip>
+#include <fstream> 
+#include <ctime>
+#include <vector>
+#include <memory>
+#include <sstream>
+#include <algorithm>
+
+// Backward compatibility guard for C++11 environments
+#if __cplusplus < 201402L && !defined(_MSC_VER)
+namespace std {
+    template<typename T, typename... Args>
+    std::unique_ptr<T> make_unique(Args&&... args) {
+        return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
+    }
+}
+#endif
+
+
+// ==========================================
+// SYSTEM DATE & TIME UTILITY
+// ==========================================
+inline std::string getCurrentDateTime() {
+    std::time_t now = std::time(nullptr);
+    std::tm ltm;
+#if defined(_MSC_VER)
+    localtime_s(&ltm, &now);
+#else
+    std::tm* ltm_ptr = std::localtime(&now);
+    if (ltm_ptr) {
+        ltm = *ltm_ptr;
+    }
+    else {
+        std::memset(&ltm, 0, sizeof(std::tm));
+    }
+#endif
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ltm);
+    return std::string(buf);
+}
+
+static std::string trim(const std::string& str) {
+    if (str.empty()) return str;
+    size_t first = str.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\r\n");
+    return str.substr(first, (last - first + 1));
+}
+
+// ==========================================
+// ORDER, WARRANTY & RESTOCK STRUCTURES
+// ==========================================
+struct PurchasedItem {
+    std::string productID = "";
+    std::string productName = "";
+    int quantity = 0;
+    double pricePaid = 0.0;
+    std::string purchaseDate = "";
+    int warrantyMonths = 0;
+};
+
+struct CustomerOrder {
+    std::string orderID = "";
+    std::string customerID = "";
+    std::string productID = "";
+    int quantity = 0;
+    double totalPrice = 0.0;
+    bool isApproved = false;
+    bool isRejected = false;
+};
+
+struct WarrantyClaim {
+    std::string claimID = "";
+    std::string customerID = "";
+    std::string productID = "";
+    std::string claimType = "";
+    double refundAmount = 0.0;
+    bool isProcessed = false;
+};
+
+struct RestockRequest {
+    std::string orderID = "";
+    std::string supplierID = "";
+    std::string productID = "";
+    int quantityRequested = 0;
+    bool isFulfilled = false;
+};
+
+// ==========================================
+// 19. BARCODE CLASS (Utility)
+// ==========================================
+class Barcode {
+private:
+    std::string barcodeValue;
+    std::string format; // EAN13, QR, UPC
+
+public:
+    Barcode() : barcodeValue("000000000000"), format("UPC") {}
+
+    Barcode(const std::string& val, const std::string& fmt) : format(fmt) {
+        setValue(val);
+    }
+
+    void setValue(std::string val) {
+        if (format == "EAN13" && (val.length() != 13 || val.find_first_not_of("0123456789") != std::string::npos)) {
+            barcodeValue = "0000000000000";
+        }
+        else if (format == "UPC" && (val.length() != 12 || val.find_first_not_of("0123456789") != std::string::npos)) {
+            barcodeValue = "000000000000";
+        }
+        else {
+            barcodeValue = val;
+        }
+    }
+
+    std::string getValue() const { return barcodeValue; }
+    std::string getFormat() const { return format; }
+
+    bool validate() const {
+        if (format == "EAN13") return barcodeValue.length() == 13;
+        if (format == "UPC") return barcodeValue.length() == 12;
+        return !barcodeValue.empty();
+    }
+
+    std::string scan() const {
+        return "[" + format + "] " + barcodeValue;
+    }
+
+    bool operator==(const Barcode& other) const {
+        return (barcodeValue == other.barcodeValue && format == other.format);
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const Barcode& b) {
+        os << b.scan();
+        return os;
+    }
+};
+
+// ==========================================
+// 16. DISCOUNT POLICY (Abstract Strategy)
+// ==========================================
+class DiscountPolicy {
+protected:
+    std::string policyName;
+    std::string startDate;
+    std::string endDate;
+
+public:
+    DiscountPolicy(std::string name, std::string start, std::string end)
+        : policyName(name), startDate(start), endDate(end) {
+    }
+
+    virtual ~DiscountPolicy() {}
+
+    virtual double calculate(double price) = 0;
+
+    virtual bool isActive() const;
+
+    std::string getPolicyName() const { return policyName; }
+
+    friend std::ostream& operator<<(std::ostream& os, const DiscountPolicy& dp) {
+        os << "Policy: " << dp.policyName << " [" << dp.startDate << " to " << dp.endDate << "]";
+        return os;
+    }
+};
+
+// ==========================================
+// 17. BULK DISCOUNT CLASS (Concrete Strategy)
+// ==========================================
+class BulkDiscount : public DiscountPolicy {
+private:
+    int minQuantity;
+    double discountPercent;
+    int currentQuantity;
+
+public:
+    BulkDiscount(std::string name, std::string start, std::string end, int minQty, double percent)
+        : DiscountPolicy(name, start, end), minQuantity(minQty), discountPercent(percent), currentQuantity(0) {
+    }
+
+    void setCurrentQuantity(int qty) { currentQuantity = qty; }
+
+    double calculate(double price) override {
+        if (isActive()) {
+            return price * (1.0 - (discountPercent / 100.0));
+        }
+        return price;
+    }
+
+    bool isActive() const override {
+        return DiscountPolicy::isActive() && (currentQuantity >= minQuantity);
+    }
+};
+
+// ==========================================
+// 18. SEASONAL DISCOUNT CLASS (Concrete Strategy)
+// ==========================================
+class SeasonalDiscount : public DiscountPolicy {
+private:
+    std::string seasonName;
+    double discountRate;
+
+public:
+    SeasonalDiscount(std::string name, std::string start, std::string end, std::string season, double rate)
+        : DiscountPolicy(name, start, end), seasonName(season), discountRate(rate) {
+    }
+
+    double calculate(double price) override {
+        if (isActive()) {
+            return price * (1.0 - discountRate);
+        }
+        return price;
+    }
+
+    bool isActive() const override { return DiscountPolicy::isActive(); }
+
+    std::string getSeasonName() const { return seasonName; }
+};
+
+// ==========================================
+// 01. PRODUCT CLASS (Abstract Root)
+// ==========================================
+class Product {
+protected:
+    std::string productID;
+    std::string productName;
+    double price;
+    double originalPrice;
+    int quantity;
+    Barcode barcode;
+    std::string activeDiscountPolicyName;
+    int storageNumber = 1;
+
+public:
+    Product(std::string id, std::string name, double p, int qty, Barcode b)
+        : productID(id), productName(name), price(p), originalPrice(p), quantity(qty), barcode(b), activeDiscountPolicyName("None") {
+    }
+
+    virtual ~Product() {}
+
+    virtual std::unique_ptr<Product> clone() const = 0;
+    virtual double calculateValue() const { return price * quantity; };
+
+    virtual void displayStatus() = 0;
+    virtual double calculateRisk() = 0;
+    virtual void applyDiscount(DiscountPolicy& policy) = 0;
+    virtual std::string getCategory() const = 0;
+    virtual std::string serialize() const = 0;
+
+    virtual std::string getSubtype() const { return "Standard"; }
+    virtual int getWarrantyMonths() const { return 0; }
+
+    virtual void checkSafety() {
+        std::cout << "[Safety Check] Product " << productName << " passes baseline standard audits." << std::endl;
+    }
+
+    void printDiscountInfo() const {
+        if (activeDiscountPolicyName != "None" && price < originalPrice) {
+            double pct = getDiscountPercent();
+            std::cout << " [SALE: Save " << std::fixed << std::setprecision(0) << pct
+                << "%! Original: $" << std::fixed << std::setprecision(2) << originalPrice
+                << " | Current: $" << price << " (via " << activeDiscountPolicyName << ")]";
+        }
+    }
+
+    double getDiscountPercent() const {
+        if (originalPrice <= 0.0) return 0.0;
+        return ((originalPrice - price) / originalPrice) * 100.0;
+    }
+
+    std::string getProductID() const { return productID; }
+    std::string getProductName() const { return productName; }
+    double getPrice() const { return price; }
+    int getQuantity() const { return quantity; }
+    Barcode getBarcode() const { return barcode; }
+
+    void setPrice(double p) { price = p; }
+    void setQuantity(int qty) { quantity = qty; }
+
+    void setStorageNumber(int num) { storageNumber = num; }
+    int getStorageNumber() const { return storageNumber; }
+
+    bool operator==(const Product& other) const {
+        return productID == other.productID;
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const Product& p) {
+        os << "ID: " << p.productID << " | Name: " << p.productName
+            << " | Price: $" << std::fixed << std::setprecision(2) << p.price
+            << " | Qty: " << p.quantity << " | Barcode: " << p.barcode;
+        if (p.activeDiscountPolicyName != "None") {
+            os << " [Discounted from $" << p.originalPrice << " via " << p.activeDiscountPolicyName << "]";
+        }
+        return os;
+    }
+};
+
+// ==========================================
+// 02. ELECTRONIC PRODUCT CLASS (Level 2)
+// ==========================================
+class ElectronicProduct : public Product {
+protected:
+    int voltage;
+    int warrantyMonths;
+    std::string brandName;
+
+public:
+    ElectronicProduct(std::string id, std::string name, double p, int qty, Barcode b,
+        int volt, int warranty, std::string brand)
+        : Product(id, name, p, qty, b), voltage(volt), warrantyMonths(warranty), brandName(brand) {
+    }
+
+    ~ElectronicProduct() override = default;
+
+    std::unique_ptr<Product> clone() const override {
+        return std::make_unique<ElectronicProduct>(*this);
+    }
+
+    bool testHardware() const { return (voltage >= 110 && voltage <= 240); }
+
+    std::string getWarrantyStatus() const {
+        std::ostringstream oss;
+        oss << warrantyMonths << " Month Warranty from " << brandName;
+        return oss.str();
+    }
+
+    std::string getCategory() const override { return "Electronic"; }
+    int getWarrantyMonths() const override { return warrantyMonths; }
+
+    std::string serialize() const override {
+        std::ostringstream oss;
+        oss << productID << "," << productName << "," << price << "," << quantity << ",Electronic,Standard," << storageNumber << ","
+            << barcode.getValue() << "," << barcode.getFormat() << "," << voltage << "," << warrantyMonths << "," << brandName;
+        return oss.str();
+    }
+
+    void displayStatus() override {
+        std::cout << "[Electronic] " << productName << " (ID: " << productID
+            << ") | Brand: " << brandName << " | Voltage: " << voltage
+            << "V | Price: $" << std::fixed << std::setprecision(2) << price
+            << " | Stock: " << quantity;
+        printDiscountInfo();
+        std::cout << std::endl;
+    }
+
+    double calculateRisk() override {
+        return (static_cast<double>(voltage) * 0.02) + (36.0 / (static_cast<double>(warrantyMonths) + 1.0));
+    }
+
+    void applyDiscount(DiscountPolicy& policy) override {
+        BulkDiscount* bulk = dynamic_cast<BulkDiscount*>(&policy);
+        if (bulk) {
+            bulk->setCurrentQuantity(quantity);
+        }
+        if (policy.isActive()) {
+            activeDiscountPolicyName = policy.getPolicyName();
+            setPrice(policy.calculate(originalPrice));
+        }
+        else {
+            std::cout << "[Notice] Discount Policy '" << policy.getPolicyName() << "' is not currently active." << std::endl;
+        }
+    }
+};
+
+// ==========================================
+// 03. FRAGILE ELECTRONICS CLASS (Level 3)
+// ==========================================
+class FragileElectronics : public ElectronicProduct {
+private:
+    int fragilityRating;
+    std::string packagingType;
+
+public:
+    FragileElectronics(std::string id, std::string name, double p, int qty, Barcode b,
+        int volt, int warranty, std::string brand, int fragility, std::string packType)
+        : ElectronicProduct(id, name, p, qty, b, volt, warranty, brand),
+        fragilityRating(fragility), packagingType(packType) {
+    }
+
+    std::unique_ptr<Product> clone() const override {
+        return std::make_unique<FragileElectronics>(*this);
+    }
+
+    std::string getCategory() const override { return "Electronic"; }
+    std::string getSubtype() const override { return "Fragile"; }
+
+    std::string serialize() const override {
+        std::ostringstream oss;
+        oss << productID << "," << productName << "," << price << "," << quantity << ",Electronic,Fragile," << storageNumber << ","
+            << barcode.getValue() << "," << barcode.getFormat() << "," << voltage << "," << warrantyMonths << "," << brandName << ","
+            << fragilityRating << "," << packagingType;
+        return oss.str();
+    }
+
+    void displayStatus() override {
+        std::cout << "[Fragile Electronic] " << productName << " (ID: " << productID
+            << ") | Brand: " << brandName << " | Fragility: " << fragilityRating << "/10"
+            << " | Price: $" << std::fixed << std::setprecision(2) << price;
+        printDiscountInfo();
+        std::cout << std::endl;
+    }
+
+    double calculateRisk() override {
+        return ElectronicProduct::calculateRisk() * (1.0 + (static_cast<double>(fragilityRating) * 0.2));
+    }
+
+    void applyDiscount(DiscountPolicy& policy) override {
+        ElectronicProduct::applyDiscount(policy);
+    }
+
+    double calculateShippingRisk() const { return static_cast<double>(fragilityRating) * 1.5; }
+
+    std::string getPackagingGuide() const {
+        return "Wrap with " + packagingType + " and apply 'FRAGILE' shipping labels.";
+    }
+};
+
+// ==========================================
+// 04. GROCERY PRODUCT CLASS (Level 2)
+// ==========================================
+class GroceryProduct : public Product {
+protected:
+    int calories;
+    bool isHalal;
+    std::string countryOfOrigin;
+
+public:
+    GroceryProduct(std::string id, std::string name, double p, int qty, Barcode b,
+        int cal, bool halal, std::string origin)
+        : Product(id, name, p, qty, b), calories(cal), isHalal(halal), countryOfOrigin(origin) {
+    }
+
+    std::unique_ptr<Product> clone() const override {
+        return std::make_unique<GroceryProduct>(*this);
+    }
+
+    std::string getCategory() const override { return "Grocery"; }
+
+    std::string serialize() const override {
+        std::ostringstream oss;
+        oss << productID << "," << productName << "," << price << "," << quantity << ",Grocery,Standard," << storageNumber << ","
+            << barcode.getValue() << "," << barcode.getFormat() << "," << calories << "," << (isHalal ? 1 : 0) << "," << countryOfOrigin;
+        return oss.str();
+    }
+
+    void checkSafety() override {
+        std::cout << "[Safety Check] Grocery item " << productName << " imported from "
+            << countryOfOrigin << " passes standard food safety audits." << std::endl;
+    }
+
+    void displayStatus() override {
+        std::cout << "[Grocery] " << productName << " (ID: " << productID
+            << ") | Calories: " << calories << " kcal | Halal: "
+            << (isHalal ? "Yes" : "No") << " | Price: $" << std::fixed << std::setprecision(2) << price;
+        printDiscountInfo();
+        std::cout << std::endl;
+    }
+
+    double calculateRisk() override { return isHalal ? 0.1 : 0.3; }
+
+    void applyDiscount(DiscountPolicy& policy) override {
+        BulkDiscount* bulk = dynamic_cast<BulkDiscount*>(&policy);
+        if (bulk) {
+            bulk->setCurrentQuantity(quantity);
+        }
+        if (policy.isActive()) {
+            activeDiscountPolicyName = policy.getPolicyName();
+            setPrice(policy.calculate(originalPrice));
+        }
+        else {
+            std::cout << "[Notice] Discount Policy '" << policy.getPolicyName() << "' is not active." << std::endl;
+        }
+    }
+};
+
+// ==========================================
+// 05. PERISHABLE GROCERY CLASS (Level 3)
+// ==========================================
+class PerishableGrocery : public GroceryProduct {
+private:
+    std::string expiryDate;
+    double storageTemp;
+
+public:
+    PerishableGrocery(std::string id, std::string name, double p, int qty, Barcode b,
+        int cal, bool halal, std::string origin, std::string expiry, double temp)
+        : GroceryProduct(id, name, p, qty, b, cal, halal, origin),
+        expiryDate(expiry), storageTemp(temp) {
+    }
+
+    std::unique_ptr<Product> clone() const override {
+        return std::make_unique<PerishableGrocery>(*this);
+    }
+
+    std::string getCategory() const override { return "Grocery"; }
+    std::string getSubtype() const override { return "Perishable"; }
+
+    std::string getExpiryDate() const { return expiryDate; }
+    double getStorageTemp() const { return storageTemp; }
+
+    bool checkExpiry() const;
+
+    std::string serialize() const override {
+        std::ostringstream oss;
+        oss << productID << "," << productName << "," << price << "," << quantity << ",Grocery,Perishable," << storageNumber << ","
+            << barcode.getValue() << "," << barcode.getFormat() << "," << calories << "," << (isHalal ? 1 : 0) << "," << countryOfOrigin << ","
+            << expiryDate << "," << storageTemp;
+        return oss.str();
+    }
+
+    void checkSafety() override {
+        GroceryProduct::checkSafety();
+        if (checkExpiry()) {
+            std::cout << "  -> WARNING: Product expired on " << expiryDate << "!" << std::endl;
+        }
+        else {
+            std::cout << "  -> Product is safe. Storage environment: "
+                << storageTemp << "C" << std::endl;
+        }
+    }
+
+    void displayStatus() override {
+        std::cout << "[Perishable Grocery] " << productName << " (ID: " << productID
+            << ") | Expires: " << expiryDate << " | Temperature: "
+            << storageTemp << "C | Stock: " << quantity << " | Price: $" << std::fixed << std::setprecision(2) << price;
+        printDiscountInfo();
+        std::cout << std::endl;
+    }
+
+    double calculateRisk() override {
+        if (checkExpiry()) return 10.0;
+        return (storageTemp < 4.0) ? 0.5 : 2.5;
+    }
+
+    void applyDiscount(DiscountPolicy& policy) override {
+        GroceryProduct::applyDiscount(policy);
+    }
+};
+
+// ==========================================
+// 06. NON-PERISHABLE GROCERY (Level 3)
+// ==========================================
+class NonPerishable : public GroceryProduct {
+private:
+    int shelfLifeYears;
+    std::string preservativeLevel;
+
+public:
+    NonPerishable(std::string id, std::string name, double p, int qty, Barcode b,
+        int cal, bool halal, std::string origin, int shelfLife, std::string presLevel)
+        : GroceryProduct(id, name, p, qty, b, cal, halal, origin),
+        shelfLifeYears(shelfLife), preservativeLevel(presLevel) {
+    }
+
+    std::unique_ptr<Product> clone() const override {
+        return std::make_unique<NonPerishable>(*this);
+    }
+
+    std::string getCategory() const override { return "Grocery"; }
+    std::string getSubtype() const override { return "Non-Perishable"; }
+
+    std::string getStorageInstructions() const {
+        std::ostringstream oss;
+        oss << "Store in dry room condition. Preservation category: " << preservativeLevel;
+        return oss.str();
+    }
+
+    std::string serialize() const override {
+        std::ostringstream oss;
+        oss << productID << "," << productName << "," << price << "," << quantity << ",Grocery,Non-Perishable," << storageNumber << ","
+            << barcode.getValue() << "," << barcode.getFormat() << "," << calories << "," << (isHalal ? 1 : 0) << "," << countryOfOrigin << ","
+            << shelfLifeYears << "," << preservativeLevel;
+        return oss.str();
+    }
+
+    void checkSafety() override {
+        std::cout << "[Safety Check] Non-perishable " << productName
+            << " has preservation level stability check passed: " << preservativeLevel << std::endl;
+    }
+
+    void displayStatus() override {
+        std::cout << "[Non-Perishable Grocery] " << productName << " (ID: " << productID
+            << ") | Shelf life: " << shelfLifeYears << " years | Preservatives: "
+            << preservativeLevel << " | Price: $" << std::fixed << std::setprecision(2) << price;
+        printDiscountInfo();
+        std::cout << std::endl;
+    }
+
+    double calculateRisk() override { return 0.005; }
+
+    void applyDiscount(DiscountPolicy& policy) override {
+        GroceryProduct::applyDiscount(policy);
+    }
+};
+
+// ==========================================
+// VEG/FRUIT GROCERY CLASS (Level 3)
+// ==========================================
+class VegFruitGrocery : public GroceryProduct {
+public:
+    VegFruitGrocery(std::string id, std::string name, double pricePerKg, int qtyGrams, Barcode b,
+        int cal, bool halal, std::string origin)
+        : GroceryProduct(id, name, pricePerKg, qtyGrams, b, cal, halal, origin) {
+    }
+
+    std::unique_ptr<Product> clone() const override {
+        return std::make_unique<VegFruitGrocery>(*this);
+    }
+
+    std::string getCategory() const override { return "Grocery"; }
+    std::string getSubtype() const override { return "VegFruit"; }
+
+    double calculateValue() const override {
+        return (price / 1000.0) * static_cast<double>(quantity);
+    }
+
+    std::string serialize() const override {
+        std::ostringstream oss;
+        oss << productID << "," << productName << "," << price << "," << quantity << ",Grocery,VegFruit," << storageNumber << ","
+            << barcode.getValue() << "," << barcode.getFormat() << "," << calories << "," << (isHalal ? 1 : 0) << "," << countryOfOrigin;
+        return oss.str();
+    }
+
+    void displayStatus() override {
+        double kg = static_cast<double>(quantity) / 1000.0;
+        std::cout << "[Veg/Fruit] " << productName << " (ID: " << productID
+            << ") | Stock: " << std::fixed << std::setprecision(2) << kg << " kg"
+            << " | Price: $" << std::fixed << std::setprecision(2) << price << "/kg";
+        printDiscountInfo();
+        std::cout << std::endl;
+    }
+
+    double calculateRisk() override { return isHalal ? 0.05 : 0.2; }
+
+    void applyDiscount(DiscountPolicy& policy) override {
+        GroceryProduct::applyDiscount(policy);
+    }
+};
+
+// ==========================================
+// 07. CLOTHING PRODUCT CLASS (Level 2)
+// ==========================================
+class ClothingProduct : public Product {
+private:
+    std::string size;
+    std::string fabric;
+    std::string gender;
+
+public:
+    ClothingProduct(std::string id, std::string name, double p, int qty, Barcode b,
+        std::string sz, std::string fab, std::string gen)
+        : Product(id, name, p, qty, b), size(sz), fabric(fab), gender(gen) {
+    }
+
+    std::unique_ptr<Product> clone() const override {
+        return std::make_unique<ClothingProduct>(*this);
+    }
+
+    std::string getCategory() const override { return "Clothing"; }
+
+    std::string fitGuide() const {
+        return "Target: " + gender + " | Size: " + size + " | Material: " + fabric;
+    }
+
+    std::string serialize() const override {
+        std::ostringstream oss;
+        oss << productID << "," << productName << "," << price << "," << quantity << ",Clothing,Standard," << storageNumber << ","
+            << barcode.getValue() << "," << barcode.getFormat() << "," << size << "," << fabric << "," << gender;
+        return oss.str();
+    }
+
+    void displayStatus() override {
+        std::cout << "[Clothing] " << productName << " (ID: " << productID
+            << ") | Size: " << size << " | Material: " << fabric << " | Stock: " << quantity << " | Price: $" << std::fixed << std::setprecision(2) << price;
+        printDiscountInfo();
+        std::cout << std::endl;
+    }
+
+    double calculateRisk() override { return 0.15; }
+
+    void applyDiscount(DiscountPolicy& policy) override {
+        BulkDiscount* bulk = dynamic_cast<BulkDiscount*>(&policy);
+        if (bulk) {
+            bulk->setCurrentQuantity(quantity);
+        }
+        if (policy.isActive()) {
+            activeDiscountPolicyName = policy.getPolicyName();
+            setPrice(policy.calculate(originalPrice));
+        }
+        else {
+            std::cout << "[Notice] Discount Policy '" << policy.getPolicyName() << "' is not active." << std::endl;
+        }
+    }
+};
+
+// ==========================================
+// 08. STORAGE SECTION CLASS (Composition)
+// ==========================================
+class Storage {
+private:
+    int storageNumber;
+    int capacity;
+    std::string allowedCategory;
+    std::vector<std::unique_ptr<Product>> products;
+
+public:
+    Storage() : storageNumber(0), capacity(10), allowedCategory("Any") {}
+
+    Storage(int number, int cap, std::string restriction)
+        : storageNumber(number), capacity(cap), allowedCategory(restriction) {
+    }
+
+    Storage(const Storage& other)
+        : storageNumber(other.storageNumber), capacity(other.capacity), allowedCategory(other.allowedCategory) {
+        for (const auto& item : other.products) {
+            if (item) {
+                products.push_back(item->clone());
+            }
+        }
+    }
+
+    Storage& operator=(const Storage& other) {
+        if (this != &other) {
+            storageNumber = other.storageNumber;
+            capacity = other.capacity;
+            allowedCategory = other.allowedCategory;
+            products.clear();
+            for (const auto& item : other.products) {
+                if (item) {
+                    products.push_back(item->clone());
+                }
+            }
+        }
+        return *this;
+    }
+
+    Storage(Storage&&) noexcept = default;
+    Storage& operator=(Storage&&) noexcept = default;
+    ~Storage() = default;
+
+    int getStorageNumber() const { return storageNumber; }
+    int getProductCount() const { return static_cast<int>(products.size()); }
+    int getCapacity() const { return capacity; }
+    std::string getAllowedCategory() const { return allowedCategory; }
+
+    bool addStock(std::unique_ptr<Product> p) {
+        if (allowedCategory != "Any" && p->getCategory() != allowedCategory) {
+            std::cout << "\n[Error] Cannot place item in this area!" << std::endl;
+            std::cout << "  -> " << p->getProductName() << " is of category: " << p->getCategory() << std::endl;
+            std::cout << "  -> Storage " << storageNumber << " only accepts: " << allowedCategory << std::endl;
+            return false;
+        }
+        p->setStorageNumber(storageNumber);
+        products.push_back(std::move(p));
+        return true;
+    }
+
+    std::unique_ptr<Product> takeProduct(int index) {
+        if (index < 0 || index >= static_cast<int>(products.size())) return nullptr;
+        std::unique_ptr<Product> p = std::move(products[index]);
+        products.erase(products.begin() + index);
+        return p;
+    }
+
+    void removeStock(const std::string& id) {
+        products.erase(std::remove_if(products.begin(), products.end(),
+            [&id](const std::unique_ptr<Product>& p) { return p->getProductID() == id; }),
+            products.end());
+    }
+
+    void sortByID() {
+        std::sort(products.begin(), products.end(),
+            [](const std::unique_ptr<Product>& a, const std::unique_ptr<Product>& b) {
+                return a->getProductID() < b->getProductID();
+            });
+    }
+
+    double getTotalValue() const {
+        double total = 0.0;
+        for (const auto& p : products) {
+            if (p) {
+                total += p->calculateValue();
+            }
+        }
+        return total;
+    }
+
+    void checkAllExpiries() {
+        std::cout << "\n>>> Conducting Dynamic Safety and Expiry Audits inside Storage " << storageNumber << " <<<" << std::endl;
+        bool checkedAny = false;
+        for (auto& p : products) {
+            if (p) {
+                if (p->getSubtype() == "Perishable") {
+                    std::cout << "  * [Perishable Check] ";
+                    p->checkSafety();
+                    checkedAny = true;
+                }
+                else if (p->getSubtype() == "Non-Perishable") {
+                    std::cout << "  * [Preservation Check] ";
+                    p->checkSafety();
+                    checkedAny = true;
+                }
+            }
+        }
+        if (!checkedAny) {
+            std::cout << "  -> No perishable or preservation-stabilized grocery profiles found in this storage." << std::endl;
+        }
+    }
+
+    Product* operator[](int index) {
+        if (index < 0 || index >= static_cast<int>(products.size())) {
+            std::cerr << "Error: Storage pointer index out of bounds." << std::endl;
+            return nullptr;
+        }
+        return products[index].get();
+    }
+
+    const Product* operator[](int index) const {
+        if (index < 0 || index >= static_cast<int>(products.size())) {
+            std::cerr << "Error: Storage pointer index out of bounds." << std::endl;
+            return nullptr;
+        }
+        return products[index].get();
+    }
+
+    Storage operator+(const Storage& other) {
+        Storage merged(storageNumber, capacity + other.capacity, allowedCategory);
+        for (const auto& p : products) {
+            if (p) merged.addStock(p->clone());
+        }
+        for (const auto& p : other.products) {
+            if (p) merged.addStock(p->clone());
+        }
+        return merged;
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const Storage& s) {
+        os << "Storage Section " << s.storageNumber << " [" << s.allowedCategory << " category only] (" << s.products.size() << "/" << s.capacity << " Occupied):\n";
+        if (s.products.empty()) {
+            os << "  (Storage currently empty - awaiting employee stock entry)\n";
+        }
+        else {
+            for (size_t i = 0; i < s.products.size(); ++i) {
+                os << "  [Item " << i + 1 << "] ";
+                s.products[i]->displayStatus();
+            }
+        }
+        return os;
+    }
+};
+
+// ==========================================
+// 09. WAREHOUSE CLASS (Aggregation)
+// ==========================================
+class Warehouse {
+private:
+    std::string locationID;
+    double totalSquareFootage;
+    std::vector<Storage> storages;
+
+public:
+    Warehouse(std::string locID, double sqFootage)
+        : locationID(locID), totalSquareFootage(sqFootage) {
+    }
+
+    ~Warehouse() = default;
+
+    std::string locationID_get() const { return locationID; }
+    int getStorageCount() const { return static_cast<int>(storages.size()); }
+
+    void clearStorages() {
+        storages.clear();
+    }
+
+    Storage* getStoragePtr(int index) {
+        if (index < 0 || index >= static_cast<int>(storages.size())) return nullptr;
+        return &storages[index];
+    }
+
+    const Storage* getStoragePtr(int index) const {
+        if (index < 0 || index >= static_cast<int>(storages.size())) return nullptr;
+        return &storages[index];
+    }
+
+    Storage& getStorage(int index) {
+        if (index < 0 || index >= static_cast<int>(storages.size())) {
+            std::cerr << "[FATAL] getStorage(): index " << index
+                << " out of range (size=" << storages.size() << "). Aborting." << std::endl;
+            std::abort();
+        }
+        return storages[index];
+    }
+
+    const Storage& getStorage(int index) const {
+        if (index < 0 || index >= static_cast<int>(storages.size())) {
+            std::cerr << "[FATAL] getStorage() const: index " << index
+                << " out of range (size=" << storages.size() << "). Aborting." << std::endl;
+            std::abort();
+        }
+        return storages[index];
+    }
+
+    void addStorage(Storage st) {
+        storages.push_back(std::move(st));
+    }
+
+    double getGlobalValue() const {
+        double total = 0.0;
+        for (const auto& st : storages) {
+            total += st.getTotalValue();
+        }
+        return total;
+    }
+
+    void removeStorageByIndex(int index) {
+        if (index >= 0 && index < static_cast<int>(storages.size())) {
+            storages.erase(storages.begin() + index);
+        }
+    }
+
+    void findShortages() const {
+        std::cout << "[Low Stock Alerts] Scanning shortages in '" << locationID << "':" << std::endl;
+        bool lowFound = false;
+        for (const auto& st : storages) {
+            for (int j = 0; j < st.getProductCount(); ++j) {
+                const Product* item = st[j];
+                if (item && item->getQuantity() < 5) {
+                    std::cout << "  - ALERT: Storage " << st.getStorageNumber()
+                        << " | Item " << item->getProductName() << " (ID: "
+                        << item->getProductID() << ") has quantity " << item->getQuantity() << std::endl;
+                    lowFound = true;
+                }
+            }
+        }
+        if (!lowFound) {
+            std::cout << "  -> Storage profiles are healthy." << std::endl;
+        }
+    }
+
+    Product* findProductByID(const std::string& id) {
+        for (auto& st : storages) {
+            for (int j = 0; j < st.getProductCount(); ++j) {
+                Product* p = st[j];
+                if (p && p->getProductID() == id) {
+                    return p;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    const Product* findProductByID(const std::string& id) const {
+        for (const auto& st : storages) {
+            for (int j = 0; j < st.getProductCount(); ++j) {
+                const Product* p = st[j];
+                if (p && p->getProductID() == id) {
+                    return p;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const Warehouse& wh) {
+        os << "==========================================\n"
+            << "Warehouse: " << wh.locationID << " (" << wh.totalSquareFootage << " Sq.Ft.)\n"
+            << "Active Storage Sections: " << wh.storages.size() << "\n"
+            << "==========================================\n";
+        for (const auto& st : wh.storages) {
+            os << st << "\n";
+        }
+        return os;
+    }
+};
+
+// ==========================================
+// ABSTRACT BASE CLASS: PERSON (Identity Roots)
+// ==========================================
+class Person {
+protected:
+    std::string personID;
+    std::string name;
+
+public:
+    Person() : personID(""), name("") {}
+    Person(std::string id, std::string n) : personID(id), name(n) {}
+
+    virtual ~Person() {}
+
+    std::string getPersonID() const { return personID; }
+    std::string getName() const { return name; }
+    void setName(std::string n) { name = n; }
+
+    virtual std::string getRole() const = 0;
+};
+
+// ==========================================
+// 10. SUPPLIER CLASS (Inherits Person)
+// ==========================================
+class Supplier : public Person {
+private:
+    std::string contractTerms;
+
+public:
+    Supplier() : Person("SUP-00", "Generic Supplier"), contractTerms("Net 30") {}
+
+    Supplier(std::string sID, std::string name, std::string terms)
+        : Person(sID, name), contractTerms(terms) {
+    }
+
+    std::string getSupplierID() const { return getPersonID(); }
+    std::string getSupplierName() const { return getName(); }
+    std::string getContractTerms() const { return contractTerms; }
+
+    std::string getRole() const override { return "Supplier"; }
+
+    void orderRestock(Product& p, int qty) {
+        p.setQuantity(p.getQuantity() + qty);
+        std::cout << "[Restock Order] Vendor '" << getName() << "' supplied "
+            << qty << " units of " << p.getProductName() << std::endl;
+    }
+
+    std::string generateInvoice() const {
+        return "Invoice: " + getPersonID() + " - " + getName() + " | Contract: " + contractTerms;
+    }
+
+    bool operator==(const Supplier& other) const {
+        return getPersonID() == other.getPersonID();
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const Supplier& s) {
+        os << "Supplier [" << s.getSupplierID() << "]: " << s.getSupplierName() << " | Terms: " << s.contractTerms;
+        return os;
+    }
+};
+
+// ==========================================
+// 11. CUSTOMER CLASS (Inherits Person)
+// ==========================================
+class Customer : public Person {
+private:
+    std::string contactInfo;
+    std::vector<std::string> purchaseHistory;
+    std::vector<PurchasedItem> purchasedItems;
+    double totalSpent = 0.0;
+
+public:
+    Customer() : Person("CUST-00", "Guest"), contactInfo("None") {}
+
+    Customer(std::string cID, std::string name, std::string contact)
+        : Person(cID, name), contactInfo(contact) {
+    }
+
+    ~Customer() override = default;
+
+    std::string getCustomerID() const { return getPersonID(); }
+    std::string getCustomerName() const { return getName(); }
+    std::string getContactInfo() const { return contactInfo; }
+
+    std::string getRole() const override { return "Customer"; }
+
+    void addPurchasedItem(const PurchasedItem& item) {
+        purchasedItems.push_back(item);
+        std::ostringstream logMsg;
+        logMsg << "Cleared: Purchased " << item.quantity << "x " << item.productName
+            << " for $" << std::fixed << std::setprecision(2) << item.pricePaid
+            << " on " << item.purchaseDate;
+        purchaseHistory.push_back(logMsg.str());
+        totalSpent += item.pricePaid;
+    }
+
+    const std::vector<PurchasedItem>& getPurchasedItems() const { return purchasedItems; }
+
+    void viewPurchaseHistory() const {
+        std::cout << "Cleared Purchases for " << getName() << ":" << std::endl;
+        if (purchaseHistory.empty()) {
+            std::cout << "  No cleared, approved purchases recorded." << std::endl;
+        }
+        for (const auto& logEntry : purchaseHistory) {
+            std::cout << "  - " << logEntry << std::endl;
+        }
+    }
+
+    double getTotalSpent() const { return totalSpent; }
+
+    bool operator==(const Customer& other) const {
+        return getPersonID() == other.getPersonID();
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const Customer& c) {
+        os << "Customer [" << c.getCustomerID() << "]: " << c.getCustomerName() << " | Spent: $" << c.totalSpent;
+        return os;
+    }
+};
+
+// ==========================================
+// 12. TRANSACTION LOG (Template Class)
+// ==========================================
+template<typename T>
+class TransactionLog {
+private:
+    std::string logID;
+    std::vector<T> logHistory;
+    std::vector<std::string> timestamps;
+
+public:
+    TransactionLog() : logID("LOG-DEFAULT") {}
+    TransactionLog(std::string id) : logID(id) {}
+
+    void recordAction(T item) {
+        logHistory.push_back(item);
+        timestamps.push_back(getCurrentDateTime());
+    }
+
+    void recordActionWithTimestamp(T item, std::string ts) {
+        logHistory.push_back(item);
+        timestamps.push_back(ts);
+    }
+
+    int getLogCount() const { return static_cast<int>(logHistory.size()); }
+    T getLogEntry(int idx) const { return logHistory[idx]; }
+    std::string getTimestamp(int idx) const { return timestamps[idx]; }
+
+    void printAuditTrail() const {
+        std::cout << ">>> TIME-STAMPED AUDIT TRAIL FOR " << logID << " <<<" << std::endl;
+        for (size_t i = 0; i < logHistory.size(); ++i) {
+            std::cout << "  " << i + 1 << ". [" << timestamps[i] << "] " << logHistory[i] << std::endl;
+        }
+    }
+
+    void printAuditTrailToFile(std::ofstream& file) const {
+        file << ">>> TIME-STAMPED AUDIT TRAIL FOR " << logID << " <<<\n";
+        for (size_t i = 0; i < logHistory.size(); ++i) {
+            file << "  " << i + 1 << ". [" << timestamps[i] << "] " << logHistory[i] << "\n";
+        }
+    }
+
+    T getEntry(int index) const {
+        if (index < 0 || index >= static_cast<int>(logHistory.size())) {
+            std::cerr << "Error: Out of bounds. Returning default instantiated type." << std::endl;
+            return T();
+        }
+        return logHistory[index];
+    }
+
+    void clearLog() {
+        logHistory.clear();
+        timestamps.clear();
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const TransactionLog<T>& tl) {
+        os << "Log [" << tl.logID << "] holds " << tl.logHistory.size() << " operations.";
+        return os;
+    }
+};
+
+// ==========================================
+// 13. EMPLOYEE CLASS (Inherits Person)
+// ==========================================
+class Employee : public Person {
+protected:
+    double salary;
+    std::string shiftSchedule;
+    std::string dateOfBirth;
+    std::string joiningDate;
+    double hourlyRate;
+    int hoursWorkedThisMonth;
+
+public:
+    Employee(std::string empID, std::string name, double sal, std::string shift,
+        std::string dob, std::string joinDate, double rate)
+        : Person(empID, name), salary(sal), shiftSchedule(shift),
+        dateOfBirth(dob), joiningDate(joinDate), hourlyRate(rate), hoursWorkedThisMonth(0) {
+    }
+
+    ~Employee() override = default;
+
+    virtual void assignTask() = 0;
+
+    void setHoursWorked(int hrs) { hoursWorkedThisMonth = hrs; }
+
+    virtual double calculateMonthlyWage() const {
+        double base = hourlyRate * static_cast<double>(hoursWorkedThisMonth);
+        if (shiftSchedule == "Night" || shiftSchedule == "night") {
+            base *= 1.2;
+        }
+        return base;
+    }
+
+    virtual void generateReport() {
+        std::cout << "Employee Report: " << name << " (" << personID << ")\n"
+            << "  - DOB: " << dateOfBirth << " | Joining Date: " << joiningDate << "\n"
+            << "  - Shift: " << shiftSchedule << " | Contract Base: $" << salary << "\n"
+            << "  - Hourly Rate: $" << hourlyRate << "/hr | Hours Worked: " << hoursWorkedThisMonth << " hrs" << std::endl;
+    }
+
+    std::string getEmployeeID() const { return getPersonID(); }
+    double getSalary() const { return salary; }
+    std::string getShiftSchedule() const { return shiftSchedule; }
+    std::string getDOB() const { return dateOfBirth; }
+    std::string getJoiningDate() const { return joiningDate; }
+    double getHourlyRate() const { return hourlyRate; }
+    int getHoursWorked() const { return hoursWorkedThisMonth; }
+
+    bool operator==(const Employee& other) const {
+        return getPersonID() == other.getPersonID();
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const Employee& emp) {
+        os << "ID: " << emp.getEmployeeID() << " | " << emp.getName() << " | Shift: " << emp.shiftSchedule;
+        return os;
+    }
+};
+
+// ==========================================
+// FINANCE MANAGER
+// ==========================================
+class FinanceManager : public Employee {
+public:
+    FinanceManager(std::string empID, std::string name, double sal, std::string shift,
+        std::string dob, std::string joinDate, double rate)
+        : Employee(empID, name, sal, shift, dob, joinDate, rate) {
+    }
+
+    std::string getRole() const override { return "Finance Manager"; }
+
+    void assignTask() override {
+        std::cout << "[Task] Finance Manager " << getName() << " is auditing payroll metrics." << std::endl;
+    }
+
+    double calculateMonthlyWage() const override {
+        return salary;
+    }
+
+    void auditTreasury(const Warehouse& wh, double capital, double operatingExpenses) const {
+        double stockValue = wh.getGlobalValue();
+        std::cout << "==========================================" << std::endl;
+        std::cout << "      TREASURY & STOCK VALUE LIQUIDITY    " << std::endl;
+        std::cout << "==========================================" << std::endl;
+        std::cout << "Corporate Funds Capital     : $" << capital << std::endl;
+        std::cout << "Accumulated Expenses logged : $" << operatingExpenses << std::endl;
+        std::cout << "Inventory Stock Asset Value : $" << stockValue << std::endl;
+        double netWorth = capital + stockValue;
+        std::cout << "Estimated Gross Net Worth   : $" << netWorth << std::endl;
+        if (capital < stockValue * 0.15) {
+            std::cout << "WARNING: Capital liquid cash reserves are low compared to static stock values!" << std::endl;
+        }
+        else {
+            std::cout << "Liquidity levels are within a secure profile limit." << std::endl;
+        }
+        std::cout << "==========================================" << std::endl;
+    }
+
+    void addOperationalExpense(double amt, double& capital, double& operatingExpenses) {
+        if (capital >= amt) {
+            capital -= amt;
+            operatingExpenses += amt;
+            std::cout << "[Expense Recorded] Logged expense of $" << amt << ". Capital adjusted." << std::endl;
+        }
+        else {
+            std::cout << "[Expense Warning] Inadequate funds to process corporate transaction." << std::endl;
+        }
+    }
+};
+
+// ==========================================
+// 14. WAREHOUSE MANAGER CLASS
+// ==========================================
+// Change 1: authorityLevel removed entirely.
+class WarehouseManager : public Employee {
+private:
+    std::vector<Storage*> managedStorages;
+
+public:
+    WarehouseManager(std::string empID, std::string name, double sal, std::string shift,
+        std::string dob, std::string joinDate, double rate)
+        : Employee(empID, name, sal, shift, dob, joinDate, rate) {
+    }
+
+    ~WarehouseManager() override = default;
+
+    std::string getRole() const override { return "Warehouse Manager"; }
+
+    void addManagedStorage(Storage* st) {
+        managedStorages.push_back(st);
+    }
+
+    void assignTask() override {
+        std::cout << "[Work Order] Manager " << getName() << " is delegating localized tasks." << std::endl;
+    }
+
+    void generateReport() override {
+        Employee::generateReport();
+        std::cout << "  - Overseeing sections: " << managedStorages.size() << std::endl;
+    }
+
+    void approvePurchaseOrder(Supplier& sup, Product& p, int qty) {
+        std::cout << "[Approval] Ordering " << qty
+            << " units of " << p.getProductName() << " with " << sup.getSupplierName() << std::endl;
+        sup.orderRestock(p, qty);
+    }
+
+    void auditWarehouse(Warehouse& wh) {
+        std::cout << "[Audit Commencing] Performing complete asset audit on Warehouse: " << wh.locationID_get() << std::endl;
+        std::cout << "  Total active warehouse values: $" << wh.getGlobalValue() << std::endl;
+        wh.findShortages();
+    }
+};
+
+// ==========================================
+// 15. STOCK KEEPER CLASS (Level 2)
+// ==========================================
+class StockKeeper : public Employee {
+private:
+    int assignedStorageNumber;
+    int dailyCheckCount;
+
+public:
+    StockKeeper(std::string empID, std::string name, double sal, std::string shift,
+        std::string dob, std::string joinDate, double rate, int storage)
+        : Employee(empID, name, sal, shift, dob, joinDate, rate), assignedStorageNumber(storage), dailyCheckCount(0) {
+    }
+
+    ~StockKeeper() override = default;
+
+    std::string getRole() const override { return "Stock Keeper"; }
+    int getAssignedStorageNumber() const { return assignedStorageNumber; }
+
+    void assignTask() override {
+        std::cout << "[Task] StockKeeper " << getName() << " reports to storage section " << assignedStorageNumber
+            << " for visual audit." << std::endl;
+        dailyCheckCount++;
+    }
+
+    void generateReport() override {
+        Employee::generateReport();
+        std::cout << "  - Primary assigned Storage: " << assignedStorageNumber
+            << " | Audits executed today: " << dailyCheckCount << std::endl;
+    }
+
+    void performExpiryCheck(Storage& sec) {
+        sec.checkAllExpiries();
+    }
+
+    void restockItem(Product* p, int qty) {
+        p->setQuantity(p->getQuantity() + qty);
+        std::cout << "[Restock] Replenished " << p->getProductName()
+            << " with " << qty << " units." << std::endl;
+    }
+
+    void flagExpiredItem(PerishableGrocery& pg) {
+        if (pg.checkExpiry()) {
+            std::cout << "[HAZARD] " << pg.getProductName() << " (ID: " << pg.getProductID()
+                << ") flagged. Scheduled for safe disposal." << std::endl;
+        }
+        else {
+            std::cout << "[Safe] Product " << pg.getProductName() << " is safe. Expiration: "
+                << pg.getExpiryDate() << std::endl;
+        }
+    }
+};
+
+// ==========================================
+// SYSTEM DATABASE / CONTEXT CLASS
+// ==========================================
+class SystemState {
+public:
+    double availableCapital = 500000.00;
+    double totalOperatingExpenses = 0.0;
+    bool payrollAuthorizedByAdmin = true;
+
+    Warehouse globalWarehouse;
+    std::vector<std::unique_ptr<Employee>> employees;
+    std::vector<Customer> customers;
+    std::vector<Supplier> suppliers;
+    std::vector<RestockRequest> restockRequests;
+    std::vector<CustomerOrder> pendingOrders;
+    std::vector<WarrantyClaim> warrantyClaims;
+    TransactionLog<std::string> systemLogs;
+
+    SystemState() : globalWarehouse("Central-Depot-01", 30000.0), systemLogs("SYSTEM-AUDITS") {}
+};
+
+// ==========================================
+// MEMBER FUNCTION OUT-OF-LINE RESOLUTIONS
+// ==========================================
+bool DiscountPolicy::isActive() const {
+    std::string today = getCurrentDateTime().substr(0, 10);
+    return (today >= startDate && today <= endDate);
+}
+
+bool PerishableGrocery::checkExpiry() const {
+    std::string currentDate = getCurrentDateTime().substr(0, 10);
+    return (expiryDate < currentDate);
+}
+
+// ==========================================
+// STRICT INPUT VALIDATION HELPERS
+// ==========================================
+static bool isAllAlphaOrSpace(const std::string& str) {
+    if (str.empty()) return false;
+    for (char c : str) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == ' ')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void flushInput() {
+    std::cin.clear();
+    while (std::cin.get() != '\n' && std::cin.good());
+}
+
+static std::string readString() {
+    std::string val;
+    std::getline(std::cin, val);
+    return val;
+}
+
+static std::string readAlphaString() {
+    std::string val;
+    while (true) {
+        std::getline(std::cin, val);
+        if (isAllAlphaOrSpace(val)) {
+            break;
+        }
+        std::cout << "Invalid. Use alphabetic characters and spaces only: ";
+    }
+    return val;
+}
+
+static bool isValidDate(const std::string& str) {
+    if (str.length() != 10) return false;
+    if (str[4] != '-' || str[7] != '-') return false;
+    for (int i = 0; i < 10; ++i) {
+        if (i == 4 || i == 7) continue;
+        if (str[i] < '0' || str[i] > '9') return false;
+    }
+    int y = (str[0] - '0') * 1000 + (str[1] - '0') * 100 + (str[2] - '0') * 10 + (str[3] - '0');
+    int m = (str[5] - '0') * 10 + (str[6] - '0');
+    int d = (str[8] - '0') * 10 + (str[9] - '0');
+    if (m < 1 || m > 12) return false;
+    if (d < 1) return false;
+    bool isLeap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    int maxDays = 31;
+    if (m == 4 || m == 6 || m == 9 || m == 11) {
+        maxDays = 30;
+    }
+    else if (m == 2) {
+        maxDays = isLeap ? 29 : 28;
+    }
+    return d <= maxDays;
+}
+
+static bool isDateBeforeOrEqual(const std::string& date1, const std::string& date2) {
+    return date1 <= date2;
+}
+
+static std::string readDate() {
+    std::string input;
+    while (true) {
+        std::getline(std::cin, input);
+        if (isValidDate(input)) {
+            break;
+        }
+        std::cout << "Invalid date or calendar boundaries. Format as YYYY-MM-DD: ";
+    }
+    return input;
+}
+
+static int parseYear(const std::string& dateStr) {
+    if (dateStr.length() < 4) return 0;
+    int yr = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (dateStr[i] >= '0' && dateStr[i] <= '9') {
+            yr = yr * 10 + (dateStr[i] - '0');
+        }
+    }
+    return yr;
+}
+
+static std::string addMonthsToDate(const std::string& dateStr, int months) {
+    if (dateStr.length() != 10) return dateStr;
+    int y = parseYear(dateStr);
+    int m = (dateStr[5] - '0') * 10 + (dateStr[6] - '0');
+    int d = (dateStr[8] - '0') * 10 + (dateStr[9] - '0');
+    m += months;
+    while (m > 12) {
+        m -= 12;
+        y += 1;
+    }
+    std::ostringstream oss;
+    oss << y << "-" << std::setw(2) << std::setfill('0') << m << "-" << std::setw(2) << std::setfill('0') << d;
+    return oss.str();
+}
+
+static bool validateAgeAtJoining(const std::string& dob, const std::string& joinDate) {
+    int dobYear = parseYear(dob);
+    int joinYear = parseYear(joinDate);
+    return (joinYear - dobYear >= 20);
+}
+
+static bool validateDOBAge(const std::string& dob) {
+    int dobYear = parseYear(dob);
+    int currentYear = 2026;
+    return (currentYear - dobYear >= 20);
+}
+
+static std::string readPassword() {
+    std::string pass;
+    while (true) {
+        std::getline(std::cin, pass);
+        if (pass.length() != 8) {
+            std::cout << "Invalid. Password must be exactly 8 digits: ";
+            continue;
+        }
+        bool onlyDigits = true;
+        for (char c : pass) {
+            if (c < '0' || c > '9') {
+                onlyDigits = false;
+                break;
+            }
+        }
+        if (!onlyDigits) {
+            std::cout << "Invalid. Password must contain numeric digits only: ";
+            continue;
+        }
+        break;
+    }
+    return pass;
+}
+
+static int readInt() {
+    int val;
+    while (!(std::cin >> val)) {
+        std::cin.clear();
+        std::string dummy;
+        std::getline(std::cin, dummy);
+        std::cout << "Invalid. Please enter an integer: ";
+    }
+    flushInput();
+    return val;
+}
+
+static double readDouble() {
+    double val;
+    while (!(std::cin >> val)) {
+        std::cin.clear();
+        std::string dummy;
+        std::getline(std::cin, dummy);
+        std::cout << "Invalid. Please enter a floating value: ";
+    }
+    flushInput();
+    return val;
+}
+
+static std::string simpleHash(const std::string& str) {
+    unsigned long hash = 5381;
+    for (char c : str) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return std::to_string(hash);
+}
+
+static bool isValidEmail(const std::string& email) {
+    size_t atPos = email.find('@');
+    size_t dotPos = email.rfind('.');
+    if (atPos == std::string::npos || dotPos == std::string::npos) return false;
+    if (atPos == 0 || dotPos == email.length() - 1 || dotPos < atPos + 2) return false;
+    return true;
+}
+
+static bool isValidPhone(const std::string& phone) {
+    if (phone.empty()) return false;
+    size_t start = 0;
+    if (phone[0] == '+') start = 1;
+    if (phone.length() - start < 7 || phone.length() - start > 15) return false;
+    for (size_t i = start; i < phone.length(); ++i) {
+        if (phone[i] < '0' || phone[i] > '9') return false;
+    }
+    return true;
+}
+
+static std::string readContactInfo() {
+    std::string contact;
+    while (true) {
+        std::cout << "Enter Contact Info (Email or Phone Number): ";
+        contact = readString();
+        if (isValidEmail(contact) || isValidPhone(contact)) {
+            break;
+        }
+        std::cout << "Invalid contact format. Please input a valid Email (name@domain.com) or Phone (7-15 digits): " << std::endl;
+    }
+    return contact;
+}
+
+static bool isValidID(const std::string& id) {
+    if (id.empty()) return false;
+    for (char c : id) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::string readValidID() {
+    while (true) {
+        std::string id = readString();
+        if (isValidID(id)) {
+            return id;
+        }
+        std::cout << "Invalid ID. Use alphanumeric characters and hyphens only: ";
+    }
+}
+
+// ==========================================
+// ADMIN AUTH DEFINITIONS
+// ==========================================
+void checkOrRegisterAdmin() {
+    std::ifstream inFile("admin_credentials.txt");
+    if (!inFile.is_open()) {
+        std::cout << "==========================================" << std::endl;
+        std::cout << " FIRST-TIME SETUP: REGISTER ADMIN ACCOUNT " << std::endl;
+        std::cout << "==========================================" << std::endl;
+        std::cout << "No administrator record located. Setup Admin parameters:" << std::endl;
+        std::cout << "Enter Admin Username (Alphabets Only): ";
+        std::string user = readAlphaString();
+        std::cout << "Enter Admin Password (Exactly 8 Digits): ";
+        std::string pass = readPassword();
+        std::ofstream outFile("admin_credentials.txt");
+        if (outFile.is_open()) {
+            outFile << user << "\n" << simpleHash(pass) << "\n";
+            outFile.close();
+            std::cout << "\nAdmin configuration stored successfully!\n" << std::endl;
+        }
+        else {
+            std::cerr << "Disk Error: Unable to store credentials." << std::endl;
+        }
+    }
+    else {
+        inFile.close();
+    }
+}
+
+bool performAdminLogin() {
+    std::ifstream inFile("admin_credentials.txt");
+    std::string savedUser, savedHash;
+    if (inFile.is_open()) {
+        std::getline(inFile, savedUser);
+        std::getline(inFile, savedHash);
+        inFile.close();
+    }
+    else {
+        std::cout << "System Error: Admin file missing." << std::endl;
+        return false;
+    }
+    std::cout << "--- Administrator Login ---" << std::endl;
+    std::cout << "Username: ";
+    std::string user = readString();
+    std::cout << "Password (Exactly 8 Digits): ";
+    std::string pass = readPassword();
+    if (user == savedUser && simpleHash(pass) == savedHash) {
+        std::cout << "Access Granted.\n" << std::endl;
+        return true;
+    }
+    std::cout << "Access Denied. Incorrect credentials.\n" << std::endl;
+    return false;
+}
+
+// ==========================================
+// DUPLICATE ID DETECTION SYSTEM
+// ==========================================
+bool isEmployeeIDDuplicate(const SystemState& state, const std::string& id) {
+    for (const auto& emp : state.employees) {
+        if (emp && emp->getEmployeeID() == id) return true;
+    }
+    return false;
+}
+
+bool isProductIDDuplicate(const SystemState& state, const std::string& id) {
+    for (int i = 0; i < state.globalWarehouse.getStorageCount(); ++i) {
+        const auto& sec = state.globalWarehouse.getStorage(i);
+        for (int j = 0; j < sec.getProductCount(); ++j) {
+            const Product* p = sec[j];
+            if (p && p->getProductID() == id) return true;
+        }
+    }
+    return false;
+}
+
+bool isCustomerIDDuplicate(const SystemState& state, const std::string& id) {
+    for (const auto& cust : state.customers) {
+        if (cust.getCustomerID() == id) return true;
+    }
+    return false;
+}
+
+bool isSupplierIDDuplicate(const SystemState& state, const std::string& id) {
+    for (const auto& sup : state.suppliers) {
+        if (sup.getSupplierID() == id) return true;
+    }
+    return false;
+}
+
+// ==========================================
+// FORWARD DECLARATIONS
+// ==========================================
+void loadSuppliersCSV(SystemState& state);
+void generateFinanceExcel(const SystemState& state);
+void saveSuppliersCSV(const SystemState& state);
+void loadCustomersCSV(SystemState& state);
+void saveCustomersCSV(const SystemState& state);
+void loadEmployeesCSV(SystemState& state);
+void saveEmployeesCSV(const SystemState& state);
+void loadProductsCSV(SystemState& state);
+void saveProductsCSV(const SystemState& state);
+void loadOrdersCSV(SystemState& state);
+void saveOrdersCSV(const SystemState& state);
+void loadWarrantyClaimsCSV(SystemState& state);
+void saveWarrantyClaimsCSV(const SystemState& state);
+void loadRestockRequestsCSV(SystemState& state);
+void saveRestockRequestsCSV(const SystemState& state);
+void loadSystemLogsCSV(SystemState& state);
+void saveSystemLogsCSV(const SystemState& state);
+void loadStoragesCSV(SystemState& state);
+void saveStoragesCSV(const SystemState& state);
+void loadAllCSVFiles(SystemState& state);
+void saveAllCSVFiles(const SystemState& state);
+void appendProductRecord(const std::string& filename, const std::string& record);
+void generateWarehouseReport(const SystemState& state);
+void generatePayrollReport(const SystemState& state);
+void generateOrdersReport(const SystemState& state);
+void generateAuditLogReport(const SystemState& state);
+void generateExpiryReport(SystemState& state);
+void generateCustomerReceipt(const CustomerOrder& ord, const std::string& custName);
+
+// ==========================================
+// CSV UTILITY
+// ==========================================
+std::vector<std::string> splitString(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(str);
+    while (std::getline(tokenStream, token, delimiter)) {
+        if (!token.empty() && token.back() == '\r') {
+            token.pop_back();
+        }
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+void loadSuppliersCSV(SystemState& state) {
+    std::ifstream file("suppliers.csv");
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("ID,name") == 0) continue;
+        auto tokens = splitString(line, ',');
+        if (tokens.size() >= 3) {
+            state.suppliers.push_back(Supplier(tokens[0], tokens[1], tokens[2]));
+        }
+    }
+    file.close();
+}
+
+void saveSuppliersCSV(const SystemState& state) {
+    std::ofstream file("suppliers.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "ID,name,contract_terms\n";
+    for (const auto& sup : state.suppliers) {
+        file << sup.getSupplierID() << "," << sup.getSupplierName() << "," << sup.getContractTerms() << "\n";
+    }
+    file.close();
+}
+
+void loadCustomersCSV(SystemState& state) {
+    std::ifstream file("customers.csv");
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("ID,name") == 0) continue;
+        auto tokens = splitString(line, ',');
+        if (tokens.size() >= 3) {
+            state.customers.push_back(Customer(tokens[0], tokens[1], tokens[2]));
+        }
+    }
+    file.close();
+}
+
+void saveCustomersCSV(const SystemState& state) {
+    std::ofstream file("customers.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "ID,name,contact,totalSpent\n";
+    for (const auto& cust : state.customers) {
+        file << cust.getCustomerID() << "," << cust.getCustomerName() << "," << cust.getContactInfo() << "," << cust.getTotalSpent() << "\n";
+    }
+    file.close();
+}
+
+// Change 1: loadEmployeesCSV — WarehouseManager no longer needs authorityLevel.
+// extraField (tokens[8]) is kept as a placeholder 0 for WarehouseManager to preserve
+// CSV column alignment; for StockKeeper it remains the assigned storage number.
+void loadEmployeesCSV(SystemState& state) {
+    std::ifstream file("employees.csv");
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("ID,name") == 0) continue;
+        auto tokens = splitString(line, ',');
+        if (tokens.size() >= 9) {
+            std::string id = tokens[0];
+            std::string name = tokens[1];
+            std::string role = tokens[2];
+            std::string dob = tokens[3];
+            std::string joinDate = tokens[4];
+            std::string shift = tokens[5];
+            double salary = std::stod(tokens[6]);
+            double rate = std::stod(tokens[7]);
+            int extra = std::stoi(tokens[8]); // 0 for WM, storageNum for SK
+            int hours = 0;
+            if (tokens.size() >= 10) {
+                hours = std::stoi(tokens[9]);
+            }
+            if (role == "Warehouse Manager") {
+                auto wm = std::make_unique<WarehouseManager>(id, name, salary, shift, dob, joinDate, rate);
+                wm->setHoursWorked(hours);
+                state.employees.push_back(std::move(wm));
+            }
+            else if (role == "Stock Keeper") {
+                auto sk = std::make_unique<StockKeeper>(id, name, salary, shift, dob, joinDate, rate, extra);
+                sk->setHoursWorked(hours);
+                state.employees.push_back(std::move(sk));
+            }
+            else if (role == "Finance Manager") {
+                auto fm = std::make_unique<FinanceManager>(id, name, salary, shift, dob, joinDate, rate);
+                fm->setHoursWorked(hours);
+                state.employees.push_back(std::move(fm));
+            }
+        }
+    }
+    file.close();
+}
+
+// Change 1: saveEmployeesCSV — WarehouseManager writes 0 as extraField placeholder.
+void saveEmployeesCSV(const SystemState& state) {
+    std::ofstream file("employees.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "ID,name,role,DOB,joining date,shift,salary,rate,extraField,hoursWorked\n";
+    for (const auto& emp : state.employees) {
+        if (!emp) continue;
+        int extra = 0;
+        if (emp->getRole() == "Stock Keeper") {
+            StockKeeper* sk = dynamic_cast<StockKeeper*>(emp.get());
+            if (sk) extra = sk->getAssignedStorageNumber();
+        }
+        // WarehouseManager: extra stays 0
+        file << emp->getEmployeeID() << "," << emp->getName() << "," << emp->getRole() << ","
+            << emp->getDOB() << "," << emp->getJoiningDate() << "," << emp->getShiftSchedule() << ","
+            << emp->getSalary() << "," << emp->getHourlyRate() << "," << extra << "," << emp->getHoursWorked() << "\n";
+    }
+    file.close();
+}
+
+void loadProductsCSV(SystemState& state) {
+    std::ifstream file("products.csv");
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("ID,name") == 0) continue;
+        auto tokens = splitString(line, ',');
+        if (tokens.size() >= 9) {
+            std::string id = tokens[0];
+            std::string name = tokens[1];
+            double price = std::stod(tokens[2]);
+            int qty = std::stoi(tokens[3]);
+            std::string cat = tokens[4];
+            std::string sub = tokens[5];
+            int storageNum = std::stoi(tokens[6]);
+
+            while (state.globalWarehouse.getStorageCount() < storageNum) {
+                int nextID = state.globalWarehouse.getStorageCount() + 1;
+                state.globalWarehouse.addStorage(Storage(nextID, 50, "Any"));
+            }
+
+            Barcode b(tokens[7], tokens[8]);
+            try {
+                if (cat == "Electronic") {
+                    if (sub == "Standard" && tokens.size() >= 12) {
+                        auto p = std::make_unique<ElectronicProduct>(id, name, price, qty, b, std::stoi(tokens[9]), std::stoi(tokens[10]), tokens[11]);
+                        state.globalWarehouse.getStorage(storageNum - 1).addStock(std::move(p));
+                    }
+                    else if (sub == "Fragile" && tokens.size() >= 14) {
+                        auto p = std::make_unique<FragileElectronics>(id, name, price, qty, b, std::stoi(tokens[9]), std::stoi(tokens[10]), tokens[11], std::stoi(tokens[12]), tokens[13]);
+                        state.globalWarehouse.getStorage(storageNum - 1).addStock(std::move(p));
+                    }
+                }
+                else if (cat == "Grocery") {
+                    if (sub == "Standard" && tokens.size() >= 12) {
+                        auto p = std::make_unique<GroceryProduct>(id, name, price, qty, b, std::stoi(tokens[9]), tokens[10] == "1", tokens[11]);
+                        state.globalWarehouse.getStorage(storageNum - 1).addStock(std::move(p));
+                    }
+                    else if (sub == "VegFruit" && tokens.size() >= 12) {
+                        auto p = std::make_unique<VegFruitGrocery>(id, name, price, qty, b, std::stoi(tokens[9]), tokens[10] == "1", tokens[11]);
+                        state.globalWarehouse.getStorage(storageNum - 1).addStock(std::move(p));
+                    }
+                    else if (sub == "Perishable" && tokens.size() >= 14) {
+                        auto p = std::make_unique<PerishableGrocery>(id, name, price, qty, b, std::stoi(tokens[9]), tokens[10] == "1", tokens[11], tokens[12], std::stod(tokens[13]));
+                        state.globalWarehouse.getStorage(storageNum - 1).addStock(std::move(p));
+                    }
+                    else if (sub == "Non-Perishable" && tokens.size() >= 14) {
+                        auto p = std::make_unique<NonPerishable>(id, name, price, qty, b, std::stoi(tokens[9]), tokens[10] == "1", tokens[11], std::stoi(tokens[12]), tokens[13]);
+                        state.globalWarehouse.getStorage(storageNum - 1).addStock(std::move(p));
+                    }
+                }
+                else if (cat == "Clothing") {
+                    if (tokens.size() >= 12) {
+                        auto p = std::make_unique<ClothingProduct>(id, name, price, qty, b, tokens[9], tokens[10], tokens[11]);
+                        state.globalWarehouse.getStorage(storageNum - 1).addStock(std::move(p));
+                    }
+                }
+            }
+            catch (...) {}
+        }
+    }
+    file.close();
+}
+
+void saveProductsCSV(const SystemState& state) {
+    std::ofstream file("products.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "ID,name,price,qty,category,subtype,storageNumber,barcodeVal,barcodeFmt,fields...\n";
+    for (int i = 0; i < state.globalWarehouse.getStorageCount(); ++i) {
+        const auto& st = state.globalWarehouse.getStorage(i);
+        for (int j = 0; j < st.getProductCount(); ++j) {
+            const Product* p = st[j];
+            if (p) {
+                file << p->serialize() << "\n";
+            }
+        }
+    }
+    file.close();
+}
+
+void loadOrdersCSV(SystemState& state) {
+    std::ifstream file("orders.csv");
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("orderID") == 0) continue;
+        auto tokens = splitString(line, ',');
+        if (tokens.size() >= 7) {
+            CustomerOrder ord;
+            ord.orderID = tokens[0];
+            ord.customerID = tokens[1];
+            ord.productID = tokens[2];
+            ord.quantity = std::stoi(tokens[3]);
+            ord.totalPrice = std::stod(tokens[4]);
+            ord.isApproved = (tokens[5] == "1");
+            ord.isRejected = (tokens[6] == "1");
+            state.pendingOrders.push_back(ord);
+            if (ord.isApproved) {
+                for (auto& cust : state.customers) {
+                    if (cust.getCustomerID() == ord.customerID) {
+                        Product* p = state.globalWarehouse.findProductByID(ord.productID);
+                        PurchasedItem item;
+                        item.productID = ord.productID;
+                        item.productName = p ? p->getProductName() : "Unknown Asset";
+                        item.quantity = ord.quantity;
+                        item.pricePaid = ord.totalPrice;
+                        item.purchaseDate = getCurrentDateTime().substr(0, 10);
+                        item.warrantyMonths = p ? p->getWarrantyMonths() : 0;
+                        cust.addPurchasedItem(item);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    file.close();
+}
+
+void saveOrdersCSV(const SystemState& state) {
+    std::ofstream file("orders.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "orderID,customerID,productID,qty,totalPrice,isApproved,isRejected\n";
+    for (const auto& ord : state.pendingOrders) {
+        file << ord.orderID << "," << ord.customerID << "," << ord.productID << ","
+            << ord.quantity << "," << ord.totalPrice << "," << (ord.isApproved ? 1 : 0) << ","
+            << (ord.isRejected ? 1 : 0) << "\n";
+    }
+    file.close();
+}
+
+void loadWarrantyClaimsCSV(SystemState& state) {
+    std::ifstream file("warranty_claims.csv");
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("claimID") == 0) continue;
+        auto tokens = splitString(line, ',');
+        if (tokens.size() >= 6) {
+            WarrantyClaim cl;
+            cl.claimID = tokens[0];
+            cl.customerID = tokens[1];
+            cl.productID = tokens[2];
+            cl.claimType = tokens[3];
+            cl.refundAmount = std::stod(tokens[4]);
+            cl.isProcessed = (tokens[5] == "1");
+            state.warrantyClaims.push_back(cl);
+        }
+    }
+    file.close();
+}
+
+void saveWarrantyClaimsCSV(const SystemState& state) {
+    std::ofstream file("warranty_claims.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "claimID,customerID,productID,claimType,refundAmount,isProcessed\n";
+    for (const auto& cl : state.warrantyClaims) {
+        file << cl.claimID << "," << cl.customerID << "," << cl.productID << ","
+            << cl.claimType << "," << cl.refundAmount << "," << (cl.isProcessed ? 1 : 0) << "\n";
+    }
+    file.close();
+}
+
+void loadRestockRequestsCSV(SystemState& state) {
+    std::ifstream file("restock_requests.csv");
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("orderID") == 0) continue;
+        auto tokens = splitString(line, ',');
+        if (tokens.size() >= 5) {
+            RestockRequest req;
+            req.orderID = tokens[0];
+            req.supplierID = tokens[1];
+            req.productID = tokens[2];
+            req.quantityRequested = std::stoi(tokens[3]);
+            req.isFulfilled = (tokens[4] == "1");
+            state.restockRequests.push_back(req);
+        }
+    }
+    file.close();
+}
+
+void saveRestockRequestsCSV(const SystemState& state) {
+    std::ofstream file("restock_requests.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "orderID,supplierID,productID,qty,isFulfilled\n";
+    for (const auto& req : state.restockRequests) {
+        file << req.orderID << "," << req.supplierID << "," << req.productID << ","
+            << req.quantityRequested << "," << (req.isFulfilled ? 1 : 0) << "\n";
+    }
+    file.close();
+}
+
+void loadSystemLogsCSV(SystemState& state) {
+    std::ifstream file("system_logs.csv");
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("timestamp") == 0) continue;
+        size_t commaPos = line.find(',');
+        if (commaPos != std::string::npos) {
+            std::string ts = line.substr(0, commaPos);
+            std::string action = line.substr(commaPos + 1);
+            state.systemLogs.recordActionWithTimestamp(action, ts);
+        }
+    }
+    file.close();
+}
+
+void saveSystemLogsCSV(const SystemState& state) {
+    std::ofstream file("system_logs.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "timestamp,action\n";
+    for (int i = 0; i < state.systemLogs.getLogCount(); ++i) {
+        file << state.systemLogs.getTimestamp(i) << "," << state.systemLogs.getLogEntry(i) << "\n";
+    }
+    file.close();
+}
+
+void loadStoragesCSV(SystemState& state) {
+    state.globalWarehouse.clearStorages();
+    std::ifstream file("storages.csv");
+    if (!file.is_open()) {
+        Storage Storage1(1, 10, "Electronic");
+        Storage Storage2(2, 10, "Clothing");
+        Storage Storage3(3, 10, "Grocery");
+        state.globalWarehouse.addStorage(std::move(Storage1));
+        state.globalWarehouse.addStorage(std::move(Storage2));
+        state.globalWarehouse.addStorage(std::move(Storage3));
+        return;
+    }
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find("storageNumber") == 0) continue;
+        auto tokens = splitString(line, ',');
+        if (tokens.size() >= 3) {
+            int num = std::stoi(tokens[0]);
+            int cap = std::stoi(tokens[1]);
+            std::string cat = tokens[2];
+            state.globalWarehouse.addStorage(Storage(num, cap, cat));
+        }
+    }
+    file.close();
+}
+
+void saveStoragesCSV(const SystemState& state) {
+    std::ofstream file("storages.csv", std::ios::trunc);
+    if (!file.is_open()) return;
+    file << "storageNumber,capacity,allowedCategory\n";
+    for (int i = 0; i < state.globalWarehouse.getStorageCount(); ++i) {
+        const auto& s = state.globalWarehouse.getStorage(i);
+        file << s.getStorageNumber() << "," << s.getCapacity() << "," << s.getAllowedCategory() << "\n";
+    }
+    file.close();
+}
+
+void loadAllCSVFiles(SystemState& state) {
+    loadStoragesCSV(state);
+    loadSuppliersCSV(state);
+    loadCustomersCSV(state);
+    loadEmployeesCSV(state);
+    loadProductsCSV(state);
+    loadOrdersCSV(state);
+    loadWarrantyClaimsCSV(state);
+    loadRestockRequestsCSV(state);
+    loadSystemLogsCSV(state);
+}
+
+void saveAllCSVFiles(const SystemState& state) {
+    saveStoragesCSV(state);
+    saveSuppliersCSV(state);
+    saveCustomersCSV(state);
+    saveEmployeesCSV(state);
+    saveProductsCSV(state);
+    saveOrdersCSV(state);
+    saveWarrantyClaimsCSV(state);
+    saveRestockRequestsCSV(state);
+    saveSystemLogsCSV(state);
+}
+
+void appendProductRecord(const std::string& filename, const std::string& record) {
+    std::ofstream file(filename, std::ios::app);
+    if (file.is_open()) {
+        file << record << "\n";
+        file.close();
+    }
+}
+
+// ==========================================
+// REPORT GENERATION FUNCTIONS
+// ==========================================
+void generateWarehouseReport(const SystemState& state) {
+    std::ofstream file("warehouse_report.pdf");
+    if (!file.is_open()) return;
+    file << "==========================================\n"
+        << "        WAREHOUSE INVENTORY REPORT        \n"
+        << "==========================================\n"
+        << "Generated: " << getCurrentDateTime() << "\n\n"
+        << state.globalWarehouse << "\n"
+        << "==========================================\n"
+        << "Total Asset Valuation: $" << std::fixed << std::setprecision(2) << state.globalWarehouse.getGlobalValue() << "\n";
+    file.close();
+    std::cout << "[Report Compiled] warehouse_report.pdf created." << std::endl;
+}
+
+void generatePayrollReport(const SystemState& state) {
+    std::ofstream file("payroll_report.pdf");
+    if (!file.is_open()) return;
+    file << "==========================================\n"
+        << "           MONTHLY PAYROLL REPORT         \n"
+        << "==========================================\n"
+        << "Generated: " << getCurrentDateTime() << "\n\n";
+    double total = 0.0;
+    for (const auto& emp : state.employees) {
+        if (emp) {
+            double wage = emp->calculateMonthlyWage();
+            total += wage;
+            file << "Employee: " << emp->getName() << " (ID: " << emp->getEmployeeID() << ")\n"
+                << "  - Role: " << emp->getRole() << "\n"
+                << "  - Net Wage: $" << std::fixed << std::setprecision(2) << wage << "\n\n";
+        }
+    }
+    file << "==========================================\n"
+        << "Corporate Treasury Funds    : $" << state.availableCapital << "\n"
+        << "Accumulated Operating Costs : $" << state.totalOperatingExpenses << "\n"
+        << "Payroll Expenditures Paid   : $" << total << "\n"
+        << "==========================================\n";
+    file.close();
+    std::cout << "[Report Compiled] payroll_report.pdf created." << std::endl;
+}
+
+void generateOrdersReport(const SystemState& state) {
+    std::ofstream file("orders_report.pdf");
+    if (!file.is_open()) return;
+    file << "==========================================\n"
+        << "       ORDERS & WARRANTY CLAIMS REPORT    \n"
+        << "==========================================\n"
+        << "Generated: " << getCurrentDateTime() << "\n\n"
+        << "--- CUSTOMER ORDERS ---\n";
+    for (const auto& ord : state.pendingOrders) {
+        file << "Order ID: " << ord.orderID
+            << " | Customer: " << ord.customerID
+            << " | Product: " << ord.productID
+            << " | Qty: " << ord.quantity
+            << " | Total: $" << std::fixed << std::setprecision(2) << ord.totalPrice
+            << " | Status: " << (ord.isApproved ? "Approved" : (ord.isRejected ? "Rejected" : "Pending")) << "\n";
+    }
+    file << "\n--- WARRANTY CLAIMS ---\n";
+    for (const auto& cl : state.warrantyClaims) {
+        file << "Claim ID: " << cl.claimID
+            << " | Customer: " << cl.customerID
+            << " | Product: " << cl.productID
+            << " | Request: " << cl.claimType
+            << " | Value: $" << std::fixed << std::setprecision(2) << cl.refundAmount
+            << " | Processed: " << (cl.isProcessed ? "Yes" : "No") << "\n";
+    }
+    file.close();
+    std::cout << "[Report Compiled] orders_report.pdf created." << std::endl;
+}
+
+void generateAuditLogReport(const SystemState& state) {
+    std::ofstream file("audit_log.pdf");
+    if (!file.is_open()) return;
+    file << "==========================================\n"
+        << "           SYSTEM AUDIT LOG REPORT        \n"
+        << "==========================================\n"
+        << "Generated: " << getCurrentDateTime() << "\n\n";
+    state.systemLogs.printAuditTrailToFile(file);
+    file.close();
+    std::cout << "[Report Compiled] audit_log.pdf created." << std::endl;
+}
+
+void generateExpiryReport(SystemState& state) {
+    std::ofstream file("expiry_report.pdf");
+    if (!file.is_open()) return;
+    file << "==========================================\n"
+        << "       EXPIRED / SHELF-LIFE REPORT        \n"
+        << "==========================================\n"
+        << "Generated: " << getCurrentDateTime() << "\n\n";
+    for (int i = 0; i < state.globalWarehouse.getStorageCount(); ++i) {
+        auto& st = state.globalWarehouse.getStorage(i);
+        for (int j = 0; j < st.getProductCount(); ++j) {
+            Product* p = st[j];
+            if (p) {
+                if (p->getSubtype() == "Perishable") {
+                    PerishableGrocery* pg = dynamic_cast<PerishableGrocery*>(p);
+                    if (pg) {
+                        file << "Product: " << pg->getProductName() << " (ID: " << pg->getProductID() << ")\n"
+                            << "  - Expiry Date: " << pg->getExpiryDate() << "\n"
+                            << "  - Status: " << (pg->checkExpiry() ? "EXPIRED" : "SAFE") << "\n\n";
+                    }
+                }
+                else if (p->getSubtype() == "Non-Perishable") {
+                    NonPerishable* np = dynamic_cast<NonPerishable*>(p);
+                    if (np) {
+                        file << "Product: " << np->getProductName() << " (ID: " << np->getProductID() << ")\n"
+                            << "  - Preservation: " << np->getStorageInstructions() << "\n\n";
+                    }
+                }
+            }
+        }
+    }
+    file.close();
+    std::cout << "[Report Generated] expiry_report.pdf created successfully." << std::endl;
+}
+
+void generateCustomerReceipt(const CustomerOrder& ord, const std::string& custName) {
+    std::string filename = "receipt_" + ord.customerID + ".pdf";
+    std::ofstream file(filename);
+    if (!file.is_open()) return;
+    file << "==========================================\n"
+        << "            TRANSACTION RECEIPT           \n"
+        << "==========================================\n"
+        << "Transaction Code: " << ord.orderID << "\n"
+        << "Client Name     : " << custName << " (ID: " << ord.customerID << ")\n"
+        << "Timestamp       : " << getCurrentDateTime() << "\n"
+        << "==========================================\n"
+        << "Purchased item ID: " << ord.productID << "\n"
+        << "Units acquired   : " << ord.quantity << "\n"
+        << "Total paid       : $" << std::fixed << std::setprecision(2) << ord.totalPrice << "\n"
+        << "==========================================\n"
+        << "Thank you for shopping with us!\n";
+    file.close();
+    std::cout << "[Receipt PDF Exported] " << filename << " generated." << std::endl;
+}
+
+// ==========================================
+// ZIP / XLSX BUILDER (CRC32 + ZIP format)
+// ==========================================
+static uint32_t _crc_table[256];
+static bool _crc_ready = false;
+
+static void _init_crc() {
+    if (_crc_ready) return;
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        _crc_table[i] = c;
+    }
+    _crc_ready = true;
+}
+
+static uint32_t _crc32s(const std::string& d) {
+    _init_crc();
+    uint32_t c = 0xFFFFFFFFu;
+    for (unsigned char b : d)
+        c = _crc_table[(c ^ b) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+struct _ZEntry {
+    std::string name, data;
+    uint32_t crc = 0, off = 0;
+};
+
+static void _pu16(std::vector<uint8_t>& b, uint16_t v) {
+    b.push_back(v & 0xFF);
+    b.push_back(v >> 8);
+}
+
+static void _pu32(std::vector<uint8_t>& b, uint32_t v) {
+    b.push_back(v & 0xFF);
+    b.push_back((v >> 8) & 0xFF);
+    b.push_back((v >> 16) & 0xFF);
+    b.push_back(v >> 24);
+}
+
+static void _pstr(std::vector<uint8_t>& b, const std::string& s) {
+    for (char c : s) b.push_back((uint8_t)c);
+}
+
+static std::vector<uint8_t> _makeZip(std::vector<_ZEntry>& es) {
+    std::vector<uint8_t> buf;
+    for (auto& e : es) {
+        e.off = (uint32_t)buf.size();
+        e.crc = _crc32s(e.data);
+        _pu32(buf, 0x04034b50); _pu16(buf, 20); _pu16(buf, 0); _pu16(buf, 0);
+        _pu16(buf, 0); _pu16(buf, 0);
+        _pu32(buf, e.crc);
+        _pu32(buf, (uint32_t)e.data.size());
+        _pu32(buf, (uint32_t)e.data.size());
+        _pu16(buf, (uint16_t)e.name.size()); _pu16(buf, 0);
+        _pstr(buf, e.name); _pstr(buf, e.data);
+    }
+    uint32_t cdOff = (uint32_t)buf.size();
+    for (auto& e : es) {
+        _pu32(buf, 0x02014b50); _pu16(buf, 20); _pu16(buf, 20);
+        _pu16(buf, 0); _pu16(buf, 0); _pu16(buf, 0); _pu16(buf, 0);
+        _pu32(buf, e.crc);
+        _pu32(buf, (uint32_t)e.data.size());
+        _pu32(buf, (uint32_t)e.data.size());
+        _pu16(buf, (uint16_t)e.name.size()); _pu16(buf, 0); _pu16(buf, 0);
+        _pu16(buf, 0); _pu16(buf, 0); _pu32(buf, 0); _pu32(buf, e.off);
+        _pstr(buf, e.name);
+    }
+    uint32_t cdSz = (uint32_t)buf.size() - cdOff;
+    _pu32(buf, 0x06054b50); _pu16(buf, 0); _pu16(buf, 0);
+    _pu16(buf, (uint16_t)es.size()); _pu16(buf, (uint16_t)es.size());
+    _pu32(buf, cdSz); _pu32(buf, cdOff); _pu16(buf, 0);
+    return buf;
+}
+
+struct _SS {
+    std::vector<std::string> strs;
+
+    int add(const std::string& s) {
+        for (int i = 0; i < (int)strs.size(); i++)
+            if (strs[i] == s) return i;
+        strs.push_back(s);
+        return (int)strs.size() - 1;
+    }
+
+    static std::string escapeXml(const std::string& str) {
+        std::ostringstream oss;
+        for (char c : str) {
+            switch (c) {
+            case '&':  oss << "&amp;"; break;
+            case '<':  oss << "&lt;"; break;
+            case '>':  oss << "&gt;"; break;
+            case '"':  oss << "&quot;"; break;
+            case '\'': oss << "&apos;"; break;
+            default:   oss << c; break;
+            }
+        }
+        return oss.str();
+    }
+
+    std::string xml() const {
+        std::ostringstream o;
+        o << "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            << "<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\""
+            << " count=\"" << strs.size() << "\" uniqueCount=\"" << strs.size() << "\">";
+        for (auto& s : strs)
+            o << "<si><t xml:space=\"preserve\">" << escapeXml(s) << "</t></si>";
+        o << "</sst>";
+        return o.str();
+    }
+};
+
+static std::string _col(int c) {
+    std::string r;
+    while (c > 0) { r = (char)('A' + (c - 1) % 26) + r; c = (c - 1) / 26; }
+    return r;
+}
+
+static std::string _ref(int r, int c) {
+    return _col(c) + std::to_string(r);
+}
+
+static std::string _sc(int r, int c, int si, int s = 0) {
+    std::ostringstream o;
+    o << "<c r=\"" << _ref(r, c) << "\" t=\"s\" s=\"" << s << "\"><v>" << si << "</v></c>";
+    return o.str();
+}
+
+static std::string _nc(int r, int c, double v, int s = 0) {
+    std::ostringstream o;
+    o << "<c r=\"" << _ref(r, c) << "\" s=\"" << s << "\"><v>"
+        << std::fixed << std::setprecision(2) << v << "</v></c>";
+    return o.str();
+}
+
+static std::string _fc(int r, int c, const std::string& f, int s = 0) {
+    std::ostringstream o;
+    o << "<c r=\"" << _ref(r, c) << "\" s=\"" << s << "\"><f>" << f << "</f></c>";
+    return o.str();
+}
+
+static std::string _rO(int r) { return "<row r=\"" + std::to_string(r) + "\">"; }
+static std::string _rC() { return "</row>"; }
+static std::string _shO(const std::string& cw) {
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+        + cw + "<sheetData>";
+}
+static std::string _shC() { return "</sheetData></worksheet>"; }
+
+static std::string _stylesXml() {
+    return
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+        "<numFmts count=\"1\">"
+        "<numFmt numFmtId=\"164\" formatCode=\"\\$#,##0.00;(\\$#,##0.00);&quot;-&quot;\"/>"
+        "</numFmts>"
+        "<fonts count=\"6\">"
+        "<font><sz val=\"11\"/><name val=\"Arial\"/></font>"
+        "<font><sz val=\"11\"/><name val=\"Arial\"/><color rgb=\"FF0000FF\"/></font>"
+        "<font><sz val=\"11\"/><name val=\"Arial\"/><b/></font>"
+        "<font><sz val=\"11\"/><name val=\"Arial\"/><color rgb=\"FFFFFFFF\"/><b/></font>"
+        "<font><sz val=\"12\"/><name val=\"Arial\"/><b/><color rgb=\"FF375623\"/></font>"
+        "<font><sz val=\"11\"/><name val=\"Arial\"/><b/><color rgb=\"FF000000\"/></font>"
+        "</fonts>"
+        "<fills count=\"5\">"
+        "<fill><patternFill patternType=\"none\"/></fill>"
+        "<fill><patternFill patternType=\"gray125\"/></fill>"
+        "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF1F4E79\"/></patternFill></fill>"
+        "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFFFF2CC\"/></patternFill></fill>"
+        "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFE2EFDA\"/></patternFill></fill>"
+        "</fills>"
+        "<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>"
+        "<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>"
+        "<cellXfs count=\"8\">"
+        "<xf numFmtId=\"0\"   fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>"
+        "<xf numFmtId=\"164\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyNumberFormat=\"1\"/>"
+        "<xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>"
+        "<xf numFmtId=\"0\"   fontId=\"3\" fillId=\"2\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment horizontal=\"center\"/></xf>"
+        "<xf numFmtId=\"164\" fontId=\"5\" fillId=\"3\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyNumberFormat=\"1\"/>"
+        "<xf numFmtId=\"0\"   fontId=\"2\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>"
+        "<xf numFmtId=\"164\" fontId=\"4\" fillId=\"4\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyNumberFormat=\"1\"/>"
+        "<xf numFmtId=\"0\"   fontId=\"3\" fillId=\"2\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\"/>"
+        "</cellXfs>"
+        "</styleSheet>";
+}
+
+void generateFinanceExcel(const SystemState& state) {
+    _SS ss;
+
+    // Sheet 2: Sales Orders
+    std::ostringstream sales;
+    sales << _shO(
+        "<cols>"
+        "<col min=\"1\" max=\"1\" width=\"18\" customWidth=\"1\"/>"
+        "<col min=\"2\" max=\"2\" width=\"16\" customWidth=\"1\"/>"
+        "<col min=\"3\" max=\"3\" width=\"16\" customWidth=\"1\"/>"
+        "<col min=\"4\" max=\"4\" width=\"12\" customWidth=\"1\"/>"
+        "<col min=\"5\" max=\"5\" width=\"18\" customWidth=\"1\"/>"
+        "<col min=\"6\" max=\"6\" width=\"22\" customWidth=\"1\"/>"
+        "</cols>"
+    );
+    sales << _rO(1)
+        << "<c r=\"A1\" t=\"s\" s=\"7\"><v>" << ss.add("CUSTOMER SALES ORDERS") << "</v></c>"
+        << _rC();
+    sales << _rO(2)
+        << _sc(2, 1, ss.add("Order ID"), 3)
+        << _sc(2, 2, ss.add("Customer ID"), 3)
+        << _sc(2, 3, ss.add("Product ID"), 3)
+        << _sc(2, 4, ss.add("Quantity"), 3)
+        << _sc(2, 5, ss.add("Unit Price ($)"), 3)
+        << _sc(2, 6, ss.add("Total Revenue ($)"), 3)
+        << _rC();
+    int sRow = 3;
+    for (const auto& ord : state.pendingOrders) {
+        if (!ord.isApproved) continue;
+        double unit = (ord.quantity > 0) ? (ord.totalPrice / (double)ord.quantity) : 0.0;
+        sales << _rO(sRow)
+            << _sc(sRow, 1, ss.add(ord.orderID), 0)
+            << _sc(sRow, 2, ss.add(ord.customerID), 0)
+            << _sc(sRow, 3, ss.add(ord.productID), 0)
+            << _nc(sRow, 4, (double)ord.quantity, 0)
+            << _nc(sRow, 5, unit, 1)
+            << _fc(sRow, 6, "D" + std::to_string(sRow) + "*E" + std::to_string(sRow), 2)
+            << _rC();
+        sRow++;
+    }
+    int salesTotalRow = sRow;
+    sales << _rO(sRow)
+        << "<c r=\"E" << sRow << "\" t=\"s\" s=\"5\"><v>" << ss.add("TOTAL") << "</v></c>"
+        << _fc(sRow, 6, (sRow > 3) ? "SUM(F3:F" + std::to_string(sRow - 1) + ")" : "0", 4)
+        << _rC();
+    sales << _shC();
+
+    // Sheet 3: Payroll
+    std::ostringstream payroll;
+    payroll << _shO(
+        "<cols>"
+        "<col min=\"1\" max=\"1\" width=\"16\" customWidth=\"1\"/>"
+        "<col min=\"2\" max=\"2\" width=\"22\" customWidth=\"1\"/>"
+        "<col min=\"3\" max=\"3\" width=\"22\" customWidth=\"1\"/>"
+        "<col min=\"4\" max=\"4\" width=\"16\" customWidth=\"1\"/>"
+        "<col min=\"5\" max=\"5\" width=\"14\" customWidth=\"1\"/>"
+        "<col min=\"6\" max=\"6\" width=\"14\" customWidth=\"1\"/>"
+        "<col min=\"7\" max=\"7\" width=\"20\" customWidth=\"1\"/>"
+        "</cols>"
+    );
+    payroll << _rO(1)
+        << "<c r=\"A1\" t=\"s\" s=\"7\"><v>" << ss.add("EMPLOYEE PAYROLL WORKSHEET") << "</v></c>"
+        << _rC();
+    payroll << _rO(2)
+        << _sc(2, 1, ss.add("Employee ID"), 3)
+        << _sc(2, 2, ss.add("Name"), 3)
+        << _sc(2, 3, ss.add("Role"), 3)
+        << _sc(2, 4, ss.add("Hourly Rate ($)"), 3)
+        << _sc(2, 5, ss.add("Hours Worked"), 3)
+        << _sc(2, 6, ss.add("Shift Factor"), 3)
+        << _sc(2, 7, ss.add("Calculated Wage ($)"), 3)
+        << _rC();
+    int pRow = 3;
+    for (const auto& emp : state.employees) {
+        if (!emp) continue;
+        double sf = (emp->getShiftSchedule() == "Night" || emp->getShiftSchedule() == "night") ? 1.2 : 1.0;
+        payroll << _rO(pRow)
+            << _sc(pRow, 1, ss.add(emp->getEmployeeID()), 0)
+            << _sc(pRow, 2, ss.add(emp->getName()), 0)
+            << _sc(pRow, 3, ss.add(emp->getRole()), 0);
+        if (emp->getRole() == "Finance Manager") {
+            payroll << _nc(pRow, 4, 0, 1)
+                << _nc(pRow, 5, 0, 1)
+                << _nc(pRow, 6, 1.0, 1)
+                << _nc(pRow, 7, emp->getSalary(), 2);
+        }
+        else {
+            payroll << _nc(pRow, 4, emp->getHourlyRate(), 1)
+                << _nc(pRow, 5, (double)emp->getHoursWorked(), 1)
+                << _nc(pRow, 6, sf, 1)
+                << _fc(pRow, 7,
+                    "D" + std::to_string(pRow) +
+                    "*E" + std::to_string(pRow) +
+                    "*F" + std::to_string(pRow), 2);
+        }
+        payroll << _rC();
+        pRow++;
+    }
+    int payrollTotalRow = pRow;
+    payroll << _rO(pRow)
+        << "<c r=\"F" << pRow << "\" t=\"s\" s=\"5\"><v>" << ss.add("TOTAL PAYROLL") << "</v></c>"
+        << _fc(pRow, 7, (pRow > 3) ? "SUM(G3:G" + std::to_string(pRow - 1) + ")" : "0", 4)
+        << _rC();
+    payroll << _shC();
+
+    // Sheet 1: Treasury Summary
+    std::ostringstream treasury;
+    treasury << _shO(
+        "<cols>"
+        "<col min=\"1\" max=\"1\" width=\"32\" customWidth=\"1\"/>"
+        "<col min=\"2\" max=\"2\" width=\"22\" customWidth=\"1\"/>"
+        "</cols>"
+    );
+    treasury << _rO(1)
+        << "<c r=\"A1\" t=\"s\" s=\"7\"><v>" << ss.add("CORPORATE TREASURY SUMMARY") << "</v></c>"
+        << _rC();
+    treasury << _rO(3)
+        << "<c r=\"A3\" t=\"s\" s=\"5\"><v>" << ss.add("Capital Funds") << "</v></c>"
+        << _nc(3, 2, state.availableCapital, 1)
+        << _rC();
+    treasury << _rO(4)
+        << "<c r=\"A4\" t=\"s\" s=\"5\"><v>" << ss.add("Operating Expenses") << "</v></c>"
+        << _nc(4, 2, state.totalOperatingExpenses, 1)
+        << _rC();
+    treasury << _rO(5)
+        << "<c r=\"A5\" t=\"s\" s=\"5\"><v>" << ss.add("Total Sales Revenue") << "</v></c>"
+        << _fc(5, 2, "'Sales Orders'!F" + std::to_string(salesTotalRow), 2)
+        << _rC();
+    treasury << _rO(6)
+        << "<c r=\"A6\" t=\"s\" s=\"5\"><v>" << ss.add("Total Payroll Paid") << "</v></c>"
+        << _fc(6, 2, "Payroll!G" + std::to_string(payrollTotalRow), 2)
+        << _rC();
+    treasury << _rO(8)
+        << "<c r=\"A8\" t=\"s\" s=\"5\"><v>" << ss.add("Estimated Net Worth") << "</v></c>"
+        << _fc(8, 2, "B3+B5-B4-B6", 6)
+        << _rC();
+    treasury << _rO(10)
+        << "<c r=\"A10\" t=\"s\" s=\"5\"><v>" << ss.add("Liquidity Status") << "</v></c>"
+        << "<c r=\"B10\" s=\"5\"><f>IF(B3&gt;B5*0.15,\"Healthy\",\"Low Capital\")</f></c>"
+        << _rC();
+    treasury << _shC();
+
+    std::vector<_ZEntry> entries;
+    entries.push_back({ "[Content_Types].xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+        "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+        "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        "<Override PartName=\"/xl/worksheets/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        "<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>"
+        "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>"
+        "</Types>"
+        });
+    entries.push_back({ "_rels/.rels",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        "</Relationships>"
+        });
+    entries.push_back({ "xl/workbook.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\""
+        " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        "<sheets>"
+        "<sheet name=\"Treasury Summary\" sheetId=\"1\" r:id=\"rId1\"/>"
+        "<sheet name=\"Sales Orders\"     sheetId=\"2\" r:id=\"rId2\"/>"
+        "<sheet name=\"Payroll\"          sheetId=\"3\" r:id=\"rId3\"/>"
+        "</sheets>"
+        "</workbook>"
+        });
+    entries.push_back({ "xl/_rels/workbook.xml.rels",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\"     Target=\"worksheets/sheet1.xml\"/>"
+        "<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\"     Target=\"worksheets/sheet2.xml\"/>"
+        "<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\"     Target=\"worksheets/sheet3.xml\"/>"
+        "<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>"
+        "<Relationship Id=\"rId5\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\"        Target=\"styles.xml\"/>"
+        "</Relationships>"
+        });
+    entries.push_back({ "xl/worksheets/sheet1.xml", treasury.str() });
+    entries.push_back({ "xl/worksheets/sheet2.xml", sales.str() });
+    entries.push_back({ "xl/worksheets/sheet3.xml", payroll.str() });
+    entries.push_back({ "xl/sharedStrings.xml",     ss.xml() });
+    entries.push_back({ "xl/styles.xml",            _stylesXml() });
+
+    auto zip = _makeZip(entries);
+    std::ofstream f("finance_management.xlsx", std::ios::binary);
+    if (!f.is_open()) {
+        std::cout << "[Error] Could not open finance_management.xlsx for writing." << std::endl;
+        return;
+    }
+    f.write((char*)zip.data(), zip.size());
+    f.close();
+
+    std::cout << "[Excel Exported] finance_management.xlsx created successfully." << std::endl;
+    std::cout << "  Sheet 1: Treasury Summary  (Capital, Net Worth, Liquidity check)" << std::endl;
+    std::cout << "  Sheet 2: Sales Orders      (Per-order revenue, SUM total)" << std::endl;
+    std::cout << "  Sheet 3: Payroll           (Wage = Rate x Hours x Shift factor)" << std::endl;
+}
+
+// ==========================================
+// PORTAL FUNCTIONS (all at file scope)
+// ==========================================
+void runCustomerPortal(SystemState& state);
+void runSupplierPortal(SystemState& state);
+void runEmployeePortal(SystemState& state);
+
+void runAdminPortal(SystemState& state) {
+    if (performAdminLogin()) {
+        while (true) {
+            std::cout << "\n=== ADMINISTRATOR CONTROL PANEL ===" << std::endl;
+            std::cout << "1. Register Employee Account" << std::endl;
+            std::cout << "2. Register Supplier Account" << std::endl;
+            std::cout << "3. View All System Data (Warehouse & Directory)" << std::endl;
+            std::cout << "4. Audit Depot & Asset Shortages" << std::endl;
+            std::cout << "5. Authorize/Send Employee Payroll List" << std::endl;
+            std::cout << "6. Generate System Audit Log PDF Report" << std::endl;
+            std::cout << "7. Log Out Admin" << std::endl;
+            std::cout << "8. Delete Storage Section (and Reassign Products)" << std::endl;
+            std::cout << "9. Create New Storage Section" << std::endl;
+            std::cout << "Choice: ";
+            int admChoice = readInt();
+            if (admChoice == 7) break;
+
+            if (admChoice == 1) {
+                // Change 1: No authority level prompt for any role.
+                std::cout << "Select Role (1. Warehouse Manager, 2. Stock Keeper, 3. Finance Manager): ";
+                int roleSel = readInt();
+
+                if (roleSel == 3) {
+                    int currentFin = 0;
+                    for (const auto& emp : state.employees) {
+                        if (emp && emp->getRole() == "Finance Manager") {
+                            currentFin++;
+                        }
+                    }
+                    if (currentFin >= 1) {
+                        std::cout << "Error: Only one active Finance Manager account is allowed in the system." << std::endl;
+                        continue;
+                    }
+                }
+
+                std::cout << "Enter Employee ID (AlphaNumeric): ";
+                std::string eID = readValidID();
+                while (isEmployeeIDDuplicate(state, eID)) {
+                    std::cout << "Error: Employee ID already registered. Use a unique ID: ";
+                    eID = readValidID();
+                }
+
+                std::cout << "Enter Name (Alphabets Only): ";
+                std::string eName = readAlphaString();
+
+                std::cout << "Enter Date of Birth (YYYY-MM-DD): ";
+                std::string dob = readDate();
+                while (!validateDOBAge(dob)) {
+                    std::cout << "\nError: Employee must be at least 20 years old relative to current year (2026).\n";
+                    std::cout << "Re-enter Date of Birth (YYYY-MM-DD): ";
+                    dob = readDate();
+                }
+
+                std::cout << "Enter Joining Date (YYYY-MM-DD): ";
+                std::string joinDate = readDate();
+                while (!validateAgeAtJoining(dob, joinDate)) {
+                    std::cout << "\nError: Employee must be at least 20 years old at the time of joining." << std::endl;
+                    std::cout << "Re-enter Joining Date (YYYY-MM-DD): ";
+                    joinDate = readDate();
+                }
+
+                std::cout << "Enter Shift (Day/Night): ";
+                std::string eShift = readAlphaString();
+
+                double eSal = 0.0;
+                if (roleSel == 1) {
+                    // Change 1: Warehouse Manager — no authority level. Just salary and rate.
+                    std::cout << "Enter Monthly Base Salary ($): ";
+                    eSal = readDouble();
+                    std::cout << "Enter Employee Hourly Wage Rate ($): ";
+                    double rate = readDouble();
+                    state.employees.push_back(std::make_unique<WarehouseManager>(eID, eName, eSal, eShift, dob, joinDate, rate));
+                    state.systemLogs.recordAction("Registered Manager: " + eName);
+                    std::cout << "Manager account configured." << std::endl;
+                    saveEmployeesCSV(state);
+                }
+                else if (roleSel == 2) {
+                    std::cout << "Assign to Primary Storage Section (1-" << state.globalWarehouse.getStorageCount() << "): ";
+                    int storageNum = readInt();
+                    std::cout << "Enter Monthly Base Salary ($): ";
+                    eSal = readDouble();
+                    std::cout << "Enter Employee Hourly Wage Rate ($): ";
+                    double rate = readDouble();
+                    state.employees.push_back(std::make_unique<StockKeeper>(eID, eName, eSal, eShift, dob, joinDate, rate, storageNum));
+                    state.systemLogs.recordAction("Registered StockKeeper: " + eName);
+                    std::cout << "Stock Keeper account configured." << std::endl;
+                    saveEmployeesCSV(state);
+                }
+                else if (roleSel == 3) {
+                    std::cout << "Enter Monthly Base Salary ($): ";
+                    eSal = readDouble();
+                    std::cout << "Enter Employee Hourly Wage Rate ($15 - $150): ";
+                    double rate = readDouble();
+                    while (rate < 15.0 || rate > 150.0) {
+                        std::cout << "Invalid range. Enter hourly rate between $15 and $150: ";
+                        rate = readDouble();
+                    }
+                    state.employees.push_back(std::make_unique<FinanceManager>(eID, eName, eSal, eShift, dob, joinDate, rate));
+                    state.systemLogs.recordAction("Registered Finance Manager: " + eName);
+                    std::cout << "Finance Manager account configured." << std::endl;
+                    saveEmployeesCSV(state);
+                }
+                else {
+                    std::cout << "Invalid role choice." << std::endl;
+                }
+            }
+            else if (admChoice == 2) {
+                std::cout << "Enter Supplier ID (AlphaNumeric): ";
+                std::string sID = readValidID();
+                while (isSupplierIDDuplicate(state, sID)) {
+                    std::cout << "Error: Supplier ID already registered. Use a unique ID: ";
+                    sID = readValidID();
+                }
+                std::cout << "Enter Supplier Corporate Name (Alphabets Only): ";
+                std::string sName = readAlphaString();
+                std::cout << "Enter Contract Terms (e.g. Net 30): ";
+                std::string sTerms = readString();
+                state.suppliers.push_back(Supplier(sID, sName, sTerms));
+                state.systemLogs.recordAction("Registered Supplier: " + sName);
+                std::cout << "Supplier registered successfully!" << std::endl;
+                saveSuppliersCSV(state);
+            }
+            else if (admChoice == 3) {
+                std::cout << "\n--- GLOBAL WAREHOUSE CONFIGURATION ---" << std::endl;
+                std::cout << state.globalWarehouse;
+                std::cout << "\n--- REGISTERED STAFF DIRECTORY ---" << std::endl;
+                if (state.employees.empty()) std::cout << "  No active employee accounts configured." << std::endl;
+                for (auto& emp : state.employees) {
+                    if (emp) emp->generateReport();
+                }
+                std::cout << "\n--- REGISTERED SUPPLIER DIRECTORY ---" << std::endl;
+                for (const auto& sup : state.suppliers) {
+                    std::cout << "  * " << sup << std::endl;
+                }
+                std::cout << "\n--- REGISTERED CUSTOMER DIRECTORY ---" << std::endl;
+                if (state.customers.empty()) std::cout << "  No customer accounts registered." << std::endl;
+                for (const auto& cust : state.customers) {
+                    std::cout << "  * " << cust << std::endl;
+                }
+                std::cout << "\n--- SYSTEM AUDIT LOGS ---" << std::endl;
+                state.systemLogs.printAuditTrail();
+            }
+            else if (admChoice == 4) {
+                state.globalWarehouse.findShortages();
+            }
+            else if (admChoice == 5) {
+                state.payrollAuthorizedByAdmin = true;
+                state.systemLogs.recordAction("Admin sent employee list to Treasury (Authorized next payroll).");
+                std::cout << "SUCCESS: Employee list authorized and sent to Treasury." << std::endl;
+            }
+            else if (admChoice == 6) {
+                generateAuditLogReport(state);
+            }
+            else if (admChoice == 8) {
+                std::cout << "\n--- DECOMMISSION STORAGE SECTION ---" << std::endl;
+                std::cout << "Enter Storage Number to delete: ";
+                int delID = readInt();
+
+                int delIdx = -1;
+                for (int i = 0; i < state.globalWarehouse.getStorageCount(); ++i) {
+                    if (state.globalWarehouse.getStorage(i).getStorageNumber() == delID) {
+                        delIdx = i; break;
+                    }
+                }
+
+                if (delIdx == -1) {
+                    std::cout << "Error: Storage section " << delID << " not found." << std::endl;
+                }
+                else {
+                    Storage& sectionToDelete = state.globalWarehouse.getStorage(delIdx);
+                    bool canDelete = true;
+
+                    if (sectionToDelete.getProductCount() > 0) {
+                        std::cout << "WARNING: Section contains " << sectionToDelete.getProductCount() << " items." << std::endl;
+                        std::cout << "1. Move items to an existing section\n"
+                            << "2. Create a new section and move items there\n"
+                            << "3. Cancel deletion\nChoice: ";
+                        int subChoice = readInt();
+
+                        if (subChoice == 1 || subChoice == 2) {
+                            int tIdx = -1;
+
+                            if (subChoice == 2) {
+                                std::cout << "--- CREATE NEW STORAGE SECTION (inline) ---" << std::endl;
+                                std::cout << "New Storage Number: ";
+                                int nID = readInt();
+                                std::cout << "Capacity: ";
+                                int nCap = readInt();
+                                std::cout << "Category (Electronic, Clothing, Grocery, Any): ";
+                                std::string nCat = readString();
+                                state.globalWarehouse.addStorage(Storage(nID, nCap, nCat));
+                                state.systemLogs.recordAction("Admin created inline Section: " + std::to_string(nID));
+                                std::cout << "New Section " << nID << " created. Items will be moved there." << std::endl;
+                                tIdx = state.globalWarehouse.getStorageCount() - 1;
+                            }
+                            else {
+                                std::cout << "Enter Target Storage Number to move items to: ";
+                                int tID = readInt();
+                                for (int i = 0; i < state.globalWarehouse.getStorageCount(); ++i) {
+                                    if (state.globalWarehouse.getStorage(i).getStorageNumber() == tID) {
+                                        tIdx = i; break;
+                                    }
+                                }
+                            }
+
+                            if (tIdx != -1 && tIdx != delIdx) {
+                                Storage& target = state.globalWarehouse.getStorage(tIdx);
+                                Storage& src = state.globalWarehouse.getStorage(delIdx);
+                                while (src.getProductCount() > 0) {
+                                    if (target.getProductCount() < target.getCapacity()) {
+                                        auto p = src.takeProduct(0);
+                                        if (!target.addStock(std::move(p))) {
+                                            std::cout << "Category Mismatch! Cannot move all items to target section." << std::endl;
+                                            canDelete = false; break;
+                                        }
+                                    }
+                                    else {
+                                        std::cout << "Target storage is FULL. Move failed." << std::endl;
+                                        canDelete = false; break;
+                                    }
+                                }
+                                if (canDelete) {
+                                    std::cout << "All items shifted to Storage "
+                                        << state.globalWarehouse.getStorage(tIdx).getStorageNumber()
+                                        << " successfully." << std::endl;
+                                }
+                            }
+                            else {
+                                std::cout << "Invalid target section." << std::endl;
+                                canDelete = false;
+                            }
+                        }
+                        else {
+                            canDelete = false;
+                        }
+                    }
+
+                    if (canDelete) {
+                        int finalDelIdx = -1;
+                        for (int i = 0; i < state.globalWarehouse.getStorageCount(); ++i) {
+                            if (state.globalWarehouse.getStorage(i).getStorageNumber() == delID) {
+                                finalDelIdx = i; break;
+                            }
+                        }
+                        if (finalDelIdx != -1) {
+                            state.globalWarehouse.removeStorageByIndex(finalDelIdx);
+                            state.systemLogs.recordAction("Admin deleted Storage " + std::to_string(delID));
+                            saveAllCSVFiles(state);
+                            std::cout << "Storage Section " << delID << " has been removed." << std::endl;
+                        }
+                    }
+                }
+            }
+            else if (admChoice == 9) {
+                std::cout << "\n--- CREATE NEW STORAGE SECTION ---" << std::endl;
+                std::cout << "New Storage Number: "; int nID = readInt();
+                std::cout << "Capacity: "; int nCap = readInt();
+                std::cout << "Category (Electronic, Clothing, Grocery, Any): ";
+                std::string nCat = readString();
+                state.globalWarehouse.addStorage(Storage(nID, nCap, nCat));
+                state.systemLogs.recordAction("Admin created new Section: " + std::to_string(nID));
+                saveAllCSVFiles(state);
+                std::cout << "SUCCESS: New section is now active." << std::endl;
+            }
+        }
+    }
+}
+
+void runEmployeePortal(SystemState& state) {
+    std::cout << "Enter Employee ID: ";
+    std::string eID = readString();
+    Employee* activeEmp = nullptr;
+    for (auto& emp : state.employees) {
+        if (emp && emp->getEmployeeID() == eID) {
+            activeEmp = emp.get();
+            break;
+        }
+    }
+    if (!activeEmp) {
+        std::cout << "No matching ID found. Admin registration required.\n" << std::endl;
+        return;
+    }
+
+    WarehouseManager* manager = dynamic_cast<WarehouseManager*>(activeEmp);
+    StockKeeper* stockKeeper = dynamic_cast<StockKeeper*>(activeEmp);
+    FinanceManager* finance = dynamic_cast<FinanceManager*>(activeEmp);
+
+    // =========================================================
+    // Change 1: Single unified Warehouse Manager portal menu.
+    // All permissions available; no sub-level tiering.
+    // =========================================================
+    if (manager) {
+        while (true) {
+            std::cout << "\n=== WAREHOUSE MANAGER PORTAL ===" << std::endl;
+            std::cout << "1. Assign Routine Task" << std::endl;
+            std::cout << "2. Audit Depot & Asset Shortages / Generate Reports" << std::endl;
+            std::cout << "3. Request Product Restock (via Supplier)" << std::endl;
+            std::cout << "4. View Global System Logs" << std::endl;
+            std::cout << "5. View My Profile Info" << std::endl;
+            std::cout << "6. Logout" << std::endl;
+            std::cout << "Choice: ";
+            int mgrChoice = readInt();
+            if (mgrChoice == 6) break;
+
+            if (mgrChoice == 1) {
+                manager->assignTask();
+            }
+            else if (mgrChoice == 2) {
+                manager->auditWarehouse(state.globalWarehouse);
+                generateWarehouseReport(state);
+            }
+            else if (mgrChoice == 3) {
+                // Restock request logic — no dollar cap (Change 1).
+                std::cout << "Enter the ID of the product to restock: ";
+                std::string pID = readString();
+                Product* p = state.globalWarehouse.findProductByID(pID);
+                if (!p) {
+                    std::cout << "Product not found." << std::endl;
+                    continue;
+                }
+                std::cout << "Enter quantity to request: ";
+                int reqQty = readInt();
+                if (state.suppliers.empty()) {
+                    std::cout << "No suppliers registered. Ask Admin to add a supplier first." << std::endl;
+                    continue;
+                }
+                std::cout << "Available Suppliers:\n";
+                for (size_t i = 0; i < state.suppliers.size(); ++i) {
+                    std::cout << "  [" << i + 1 << "] ID: " << state.suppliers[i].getSupplierID()
+                        << " Name: " << state.suppliers[i].getSupplierName() << std::endl;
+                }
+                std::cout << "Select Supplier Index: ";
+                int supIdx = readInt();
+                if (supIdx < 1 || supIdx > static_cast<int>(state.suppliers.size())) {
+                    std::cout << "Invalid index." << std::endl;
+                    continue;
+                }
+                RestockRequest req;
+                std::ostringstream reqID;
+                reqID << "ORD-" << state.restockRequests.size() + 100;
+                req.orderID = reqID.str();
+                req.supplierID = state.suppliers[supIdx - 1].getSupplierID();
+                req.productID = pID;
+                req.quantityRequested = reqQty;
+                req.isFulfilled = false;
+                state.restockRequests.push_back(req);
+                state.systemLogs.recordAction("Restock request " + req.orderID + " created by Manager " + manager->getName() + ".");
+                std::cout << "SUCCESS: Restock request " << req.orderID << " submitted to supplier." << std::endl;
+                saveRestockRequestsCSV(state);
+            }
+            else if (mgrChoice == 4) {
+                state.systemLogs.printAuditTrail();
+            }
+            else if (mgrChoice == 5) {
+                manager->generateReport();
+            }
+        }
+    }
+    else if (stockKeeper) {
+        while (true) {
+            std::cout << "\n=== STOCK KEEPER PORTAL ===" << std::endl;
+            std::cout << "1. Register/Record New Product Data" << std::endl;
+            std::cout << "2. Perform Expiry Safety Checks on Storage / Generate Report" << std::endl;
+            std::cout << "3. Flag Expired Hazards" << std::endl;
+            std::cout << "4. Manually Adjust Stock (Storage restock)" << std::endl;
+            std::cout << "5. Apply Discount Policy to Product" << std::endl;
+            std::cout << "6. View My Profile Info" << std::endl;
+            std::cout << "7. Logout" << std::endl;
+            std::cout << "Choice: ";
+            int skChoice = readInt();
+            if (skChoice == 7) break;
+
+            if (skChoice == 1) {
+                int storageCount = state.globalWarehouse.getStorageCount();
+                std::cout << "Select Target Storage (1-" << storageCount << "):\n";
+                for (int i = 0; i < storageCount; ++i) {
+                    const Storage& s = state.globalWarehouse.getStorage(i);
+                    std::cout << "  " << (i + 1) << ". Storage " << s.getStorageNumber()
+                        << " [Category: " << s.getAllowedCategory() << "] ("
+                        << s.getProductCount() << "/" << s.getCapacity() << " Occupied)\n";
+                }
+                std::cout << "Choice: ";
+                int destStorage = readInt();
+                if (destStorage < 1 || destStorage > storageCount) {
+                    std::cout << "Storage section does not exist." << std::endl;
+                    continue;
+                }
+                Storage& activeSection = state.globalWarehouse.getStorage(destStorage - 1);
+                std::string allowedCat = activeSection.getAllowedCategory();
+
+                // =====================================================
+                // Change 2: Filter category menu by storage restriction.
+                // Build a mapping from displayed option number -> internal
+                // product type integer (1-7 as used in original code).
+                // =====================================================
+
+                // Print a contextual notice about what this storage accepts.
+                if (allowedCat != "Any") {
+                    std::cout << "\nStorage " << activeSection.getStorageNumber()
+                        << " only accepts " << allowedCat << " products.\n" << std::endl;
+                }
+
+                // Build the filtered option list.
+                // optionMap[display_index] = internal_cat_code (1..7)
+                std::vector<int> optionMap;
+
+                std::cout << "Select Category:\n";
+                int displayIdx = 1;
+
+                if (allowedCat == "Electronic" || allowedCat == "Any") {
+                    std::cout << "  " << displayIdx++ << ". Electronic\n";
+                    optionMap.push_back(1);
+                    std::cout << "  " << displayIdx++ << ". Fragile Electronic\n";
+                    optionMap.push_back(2);
+                }
+                if (allowedCat == "Grocery" || allowedCat == "Any") {
+                    std::cout << "  " << displayIdx++ << ". Grocery (Standard)\n";
+                    optionMap.push_back(3);
+                    std::cout << "  " << displayIdx++ << ". Perishable Grocery\n";
+                    optionMap.push_back(4);
+                    std::cout << "  " << displayIdx++ << ". Non-Perishable Grocery\n";
+                    optionMap.push_back(5);
+                    std::cout << "  " << displayIdx++ << ". Veg/Fruit (Sold by Weight)\n";
+                    optionMap.push_back(7);
+                }
+                if (allowedCat == "Clothing" || allowedCat == "Any") {
+                    std::cout << "  " << displayIdx++ << ". Clothing\n";
+                    optionMap.push_back(6);
+                }
+
+                std::cout << "Choice: ";
+                int displayChoice = readInt();
+
+                if (displayChoice < 1 || displayChoice > static_cast<int>(optionMap.size())) {
+                    std::cout << "Invalid category selection." << std::endl;
+                    continue;
+                }
+
+                // Resolve the internal category code from the display choice.
+                int cat = optionMap[displayChoice - 1];
+
+                std::cout << "Enter Product ID: ";
+                std::string pID = readValidID();
+                while (isProductIDDuplicate(state, pID)) {
+                    std::cout << "Error: Product ID already registered. Use a unique ID: ";
+                    pID = readValidID();
+                }
+
+                std::cout << "Enter Product Name: ";
+                std::string pName = readString();
+                std::cout << "Enter Retail Price ($): ";
+                double pPrice = readDouble();
+                std::cout << "Enter Starting Stock Quantity: ";
+                int pQty = readInt();
+                std::cout << "Enter Barcode Value: ";
+                std::string pBarVal = readString();
+                std::cout << "Enter Barcode format (UPC/EAN13): ";
+                std::string pBarFormat = readString();
+                Barcode newBarcode(pBarVal, pBarFormat);
+
+                std::unique_ptr<Product> newProd = nullptr;
+
+                if (cat == 1) {
+                    std::cout << "Enter Voltage (V): ";
+                    int volt = readInt();
+                    std::cout << "Warranty (Months): ";
+                    int war = readInt();
+                    std::cout << "Brand Name (Alphabets Only): ";
+                    std::string brand = readAlphaString();
+                    newProd = std::make_unique<ElectronicProduct>(pID, pName, pPrice, pQty, newBarcode, volt, war, brand);
+                }
+                else if (cat == 2) {
+                    std::cout << "Enter Voltage (V): ";
+                    int volt = readInt();
+                    std::cout << "Warranty (Months): ";
+                    int war = readInt();
+                    std::cout << "Brand Name (Alphabets Only): ";
+                    std::string brand = readAlphaString();
+                    std::cout << "Fragility rating (1-10): ";
+                    int frag = readInt();
+                    std::cout << "Packaging Medium: ";
+                    std::string pack = readString();
+                    newProd = std::make_unique<FragileElectronics>(pID, pName, pPrice, pQty, newBarcode, volt, war, brand, frag, pack);
+                }
+                else if (cat == 3) {
+                    std::cout << "Enter Calories: ";
+                    int cal = readInt();
+                    std::cout << "Is Halal? (1 = Yes, 0 = No): ";
+                    int halalVal = readInt();
+                    std::cout << "Country of Origin (Alphabets Only): ";
+                    std::string origin = readAlphaString();
+                    newProd = std::make_unique<GroceryProduct>(pID, pName, pPrice, pQty, newBarcode, cal, (halalVal == 1), origin);
+                }
+                else if (cat == 4) {
+                    std::cout << "Enter Calories: ";
+                    int cal = readInt();
+                    std::cout << "Is Halal? (1 = Yes, 0 = No): ";
+                    int halalVal = readInt();
+                    std::cout << "Country of Origin (Alphabets Only): ";
+                    std::string origin = readAlphaString();
+                    std::cout << "Expiration Date (YYYY-MM-DD): ";
+                    std::string exp = readDate();
+                    std::cout << "Optimal Storage Temp (C): ";
+                    double temp = readDouble();
+                    newProd = std::make_unique<PerishableGrocery>(pID, pName, pPrice, pQty, newBarcode, cal, (halalVal == 1), origin, exp, temp);
+                }
+                else if (cat == 5) {
+                    std::cout << "Enter Calories: ";
+                    int cal = readInt();
+                    std::cout << "Is Halal? (1 = Yes, 0 = No): ";
+                    int halalVal = readInt();
+                    std::cout << "Country of Origin (Alphabets Only): ";
+                    std::string origin = readAlphaString();
+                    std::cout << "Shelf Life (Years): ";
+                    int shelf = readInt();
+                    std::cout << "Preservation Level: ";
+                    std::string pres = readString();
+                    newProd = std::make_unique<NonPerishable>(pID, pName, pPrice, pQty, newBarcode, cal, (halalVal == 1), origin, shelf, pres);
+                }
+                else if (cat == 6) {
+                    std::cout << "Size (S/M/L/XL): ";
+                    std::string sz = readString();
+                    std::cout << "Fabric: ";
+                    std::string fab = readString();
+                    std::cout << "Target Gender (Alphabets Only): ";
+                    std::string gen = readAlphaString();
+                    newProd = std::make_unique<ClothingProduct>(pID, pName, pPrice, pQty, newBarcode, sz, fab, gen);
+                }
+                else if (cat == 7) {
+                    std::cout << "Enter Calories (per 100g): ";
+                    int cal = readInt();
+                    std::cout << "Is Halal? (1 = Yes, 0 = No): ";
+                    int halalVal = readInt();
+                    std::cout << "Country of Origin (Alphabets Only): ";
+                    std::string origin = readAlphaString();
+                    std::cout << "Enter Price per Kilogram ($): ";
+                    pPrice = readDouble();
+                    std::cout << "Enter Starting Stock in Kilograms (e.g. 20.0): ";
+                    double startingKg = readDouble();
+                    pQty = static_cast<int>(startingKg * 1000.0);
+                    newProd = std::make_unique<VegFruitGrocery>(pID, pName, pPrice, pQty, newBarcode, cal, (halalVal == 1), origin);
+                }
+
+                if (newProd) {
+                    std::cout << "Do you want to add an immediate seasonal discount to this product? (1 = Yes, 0 = No): ";
+                    int addDisc = readInt();
+                    if (addDisc == 1) {
+                        std::cout << "Enter Policy Name (Alphabets Only): ";
+                        std::string polName = readAlphaString();
+                        std::string startDate, endDate;
+                        std::string today = getCurrentDateTime().substr(0, 10);
+                        while (true) {
+                            std::cout << "Enter Start Date (YYYY-MM-DD) [Today or future]: ";
+                            startDate = readDate();
+                            if (!isDateBeforeOrEqual(today, startDate)) {
+                                std::cout << "Error: Start date cannot be in the past (Today is " << today << "). Please re-enter.\n";
+                                continue;
+                            }
+                            break;
+                        }
+                        while (true) {
+                            std::cout << "Enter End Date (YYYY-MM-DD) [Must be >= Start Date]: ";
+                            endDate = readDate();
+                            if (!isDateBeforeOrEqual(startDate, endDate)) {
+                                std::cout << "Error: End date cannot be before start date (" << startDate << "). Please re-enter.\n";
+                                continue;
+                            }
+                            break;
+                        }
+                        std::cout << "Enter Season Name (e.g., Summer): ";
+                        std::string sName = readAlphaString();
+                        std::cout << "Enter Discount Rate (e.g. 0.15 for 15%): ";
+                        double rate = readDouble();
+                        SeasonalDiscount policy(polName, startDate, endDate, sName, rate);
+                        newProd->applyDiscount(policy);
+                    }
+
+                    std::string serializedRecord = newProd->serialize();
+                    if (activeSection.addStock(std::move(newProd))) {
+                        state.systemLogs.recordAction(stockKeeper->getName() + " registered Product: " + pID);
+                        std::cout << "SUCCESS: Product cataloged under Storage " << destStorage << "." << std::endl;
+                        appendProductRecord("products.csv", serializedRecord);
+                    }
+                    else {
+                        std::cout << "Placement failed due to storage category restrictions." << std::endl;
+                    }
+                }
+                else {
+                    std::cout << "Failed to allocate product." << std::endl;
+                }
+            } // end skChoice == 1
+            else if (skChoice == 2) {
+                for (int i = 0; i < state.globalWarehouse.getStorageCount(); ++i) {
+                    stockKeeper->performExpiryCheck(state.globalWarehouse.getStorage(i));
+                }
+                generateExpiryReport(state);
+            }
+            else if (skChoice == 3) {
+                std::cout << "Enter Perishable Product ID to check safety: ";
+                std::string targetID = readString();
+                Product* p = state.globalWarehouse.findProductByID(targetID);
+                PerishableGrocery* pg = dynamic_cast<PerishableGrocery*>(p);
+                if (pg) {
+                    stockKeeper->flagExpiredItem(*pg);
+                }
+                else {
+                    std::cout << "Product is not classifiable as Perishable Grocery." << std::endl;
+                }
+            }
+            else if (skChoice == 4) {
+                std::cout << "Enter Product ID: ";
+                std::string targetID = readString();
+                Product* p = state.globalWarehouse.findProductByID(targetID);
+                if (p) {
+                    std::cout << "Current quantity: " << p->getQuantity() << ". Enter restocking units: ";
+                    int restockUnits = readInt();
+                    stockKeeper->restockItem(p, restockUnits);
+                    saveProductsCSV(state);
+                }
+                else {
+                    std::cout << "Product not found." << std::endl;
+                }
+            }
+            else if (skChoice == 5) {
+                std::cout << "Enter Product ID to apply discount: ";
+                std::string targetID = readString();
+                Product* p = state.globalWarehouse.findProductByID(targetID);
+                if (!p) {
+                    std::cout << "Product not found." << std::endl;
+                    continue;
+                }
+                std::cout << "Select Discount Type:\n  1. Bulk Discount\n  2. Seasonal Discount\nChoice: ";
+                int discType = readInt();
+                std::cout << "Enter Policy Name (Alphabets Only): ";
+                std::string polName = readAlphaString();
+                std::string startDate, endDate;
+                std::string today = getCurrentDateTime().substr(0, 10);
+                while (true) {
+                    std::cout << "Enter Start Date (YYYY-MM-DD) [Today or future]: ";
+                    startDate = readDate();
+                    if (!isDateBeforeOrEqual(today, startDate)) {
+                        std::cout << "Error: Start date cannot be in the past (Today is " << today << "). Please re-enter.\n";
+                        continue;
+                    }
+                    break;
+                }
+                while (true) {
+                    std::cout << "Enter End Date (YYYY-MM-DD) [Must be >= Start Date]: ";
+                    endDate = readDate();
+                    if (!isDateBeforeOrEqual(startDate, endDate)) {
+                        std::cout << "Error: End date cannot be before start date (" << startDate << "). Please re-enter.\n";
+                        continue;
+                    }
+                    break;
+                }
+                if (discType == 1) {
+                    std::cout << "Enter Minimum Quantity for Bulk Discount: ";
+                    int minQty = readInt();
+                    std::cout << "Enter Discount Percentage (e.g., 15.0 for 15%): ";
+                    double discPct = readDouble();
+                    BulkDiscount policy(polName, startDate, endDate, minQty, discPct);
+                    p->applyDiscount(policy);
+                    std::cout << "Bulk Discount applied. Updated Product Details:\n";
+                    p->displayStatus();
+                }
+                else if (discType == 2) {
+                    std::cout << "Enter Season Name (e.g., Summer): ";
+                    std::string sName = readAlphaString();
+                    std::cout << "Enter Discount Rate (e.g., 0.10 for 10%): ";
+                    double rate = readDouble();
+                    SeasonalDiscount policy(polName, startDate, endDate, sName, rate);
+                    p->applyDiscount(policy);
+                    std::cout << "Seasonal Discount applied. Updated Product Details:\n";
+                    p->displayStatus();
+                }
+                else {
+                    std::cout << "Invalid Discount type selection." << std::endl;
+                }
+            }
+            else if (skChoice == 6) {
+                stockKeeper->generateReport();
+            }
+        }
+    }
+    else if (finance) {
+        while (true) {
+            std::cout << "\n=== CORPORATE FINANCE MANAGER PORTAL ===" << std::endl;
+            std::cout << "1. Run Treasury & Inventory Money health Audit" << std::endl;
+            std::cout << "2. Record Operational Expense transaction" << std::endl;
+            std::cout << "3. Calculate & Pay Monthly Employee Wages (Interactive)" << std::endl;
+            std::cout << "4. Process Pending Customer Orders" << std::endl;
+            std::cout << "5. Process Warranty Claim Tickets (Replace / Refund)" << std::endl;
+            std::cout << "6. Export Smart Finance Excel Worksheet (CSV)" << std::endl;
+            std::cout << "7. View My Profile Info" << std::endl;
+            std::cout << "8. Logout" << std::endl;
+            std::cout << "Choice: ";
+            int finChoice = readInt();
+            if (finChoice == 8) break;
+
+            if (finChoice == 1) {
+                finance->auditTreasury(state.globalWarehouse, state.availableCapital, state.totalOperatingExpenses);
+            }
+            else if (finChoice == 2) {
+                std::cout << "Enter expense transaction amount ($): ";
+                double amt = readDouble();
+                finance->addOperationalExpense(amt, state.availableCapital, state.totalOperatingExpenses);
+                state.systemLogs.recordAction("Logged operating expense transaction of $" + std::to_string(amt));
+                saveAllCSVFiles(state);
+            }
+            else if (finChoice == 3) {
+                if (!state.payrollAuthorizedByAdmin) {
+                    std::cout << "\nError: Payroll has already been processed for this cycle.\n"
+                        << "Wages cannot be calculated until the Administrator sends the updated employee list." << std::endl;
+                    continue;
+                }
+                std::cout << "\n--- AUDITING CORPORATE PAYROLL (Interactive) ---" << std::endl;
+                double totalPayroll = 0.0;
+                if (state.employees.empty()) {
+                    std::cout << "  No active employees registered to pay." << std::endl;
+                }
+                else {
+                    for (auto& emp : state.employees) {
+                        if (!emp) continue;
+                        double wage = 0.0;
+                        if (emp.get() == finance) {
+                            wage = emp->calculateMonthlyWage();
+                            totalPayroll += wage;
+                            std::cout << "  * Employee: " << emp->getName()
+                                << " (ID: " << emp->getEmployeeID() << " | " << emp->getRole() << ")\n"
+                                << "    -> Paid standard monthly flat contract salary: $" << wage << std::endl;
+                        }
+                        else {
+                            std::cout << "  * Enter hours worked this month for " << emp->getName()
+                                << " (ID: " << emp->getEmployeeID() << " | " << emp->getRole() << "): ";
+                            int hrs = readInt();
+                            while (hrs < 0 || hrs > 400) {
+                                std::cout << "Invalid hours. Enter a value between 0 and 400: ";
+                                hrs = readInt();
+                            }
+                            emp->setHoursWorked(hrs);
+                            wage = emp->calculateMonthlyWage();
+                            totalPayroll += wage;
+                            std::cout << "    -> Calculated Wage: $" << wage << " (" << hrs
+                                << " hrs @ $" << emp->getHourlyRate() << "/hr | Shift: " << emp->getShiftSchedule() << ")\n";
+                        }
+                    }
+                    std::cout << "\nTotal Gross Payroll Expenses: $" << totalPayroll << std::endl;
+                    if (state.availableCapital >= totalPayroll) {
+                        state.availableCapital -= totalPayroll;
+                        state.totalOperatingExpenses += totalPayroll;
+                        std::cout << "SUCCESS: Paid monthly salaries. Capital updated successfully." << std::endl;
+                        state.systemLogs.recordAction("Processed payroll transaction of $" + std::to_string(totalPayroll));
+                        state.payrollAuthorizedByAdmin = false;
+                        generatePayrollReport(state);
+                        saveAllCSVFiles(state);
+                    }
+                    else {
+                        std::cout << "ERROR: Insufficient available capital to process payroll!" << std::endl;
+                    }
+                }
+            }
+            else if (finChoice == 4) {
+                std::cout << "\n--- PENDING CUSTOMER ORDERS ---" << std::endl;
+                bool found = false;
+                for (const auto& ord : state.pendingOrders) {
+                    if (!ord.isApproved && !ord.isRejected) {
+                        std::cout << "  * Order ID: " << ord.orderID
+                            << " | Customer ID: " << ord.customerID
+                            << " | Product ID: " << ord.productID
+                            << " | Qty: " << ord.quantity
+                            << " | Total Price: $" << ord.totalPrice << std::endl;
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    std::cout << "  No pending customer orders found." << std::endl;
+                    continue;
+                }
+                std::cout << "Enter Order ID to process: ";
+                std::string targetOrdID = readString();
+                CustomerOrder* selectedOrd = nullptr;
+                for (auto& ord : state.pendingOrders) {
+                    if (ord.orderID == targetOrdID && !ord.isApproved && !ord.isRejected) {
+                        selectedOrd = &ord;
+                        break;
+                    }
+                }
+                if (!selectedOrd) {
+                    std::cout << "Invalid or already processed Order ID." << std::endl;
+                    continue;
+                }
+                std::cout << "Select Action (1 to Approve, 2 to Reject): ";
+                int action = readInt();
+                if (action == 1) {
+                    Product* p = state.globalWarehouse.findProductByID(selectedOrd->productID);
+                    if (p && p->getQuantity() >= selectedOrd->quantity) {
+                        p->setQuantity(p->getQuantity() - selectedOrd->quantity);
+                        state.availableCapital += selectedOrd->totalPrice;
+                        std::string currentCustName = "Guest";
+                        for (auto& cust : state.customers) {
+                            if (cust.getCustomerID() == selectedOrd->customerID) {
+                                PurchasedItem item;
+                                item.productID = selectedOrd->productID;
+                                item.productName = p->getProductName();
+                                item.quantity = selectedOrd->quantity;
+                                item.pricePaid = selectedOrd->totalPrice;
+                                item.purchaseDate = getCurrentDateTime().substr(0, 10);
+                                item.warrantyMonths = p->getWarrantyMonths();
+                                cust.addPurchasedItem(item);
+                                currentCustName = cust.getName();
+                                break;
+                            }
+                        }
+                        selectedOrd->isApproved = true;
+                        state.systemLogs.recordAction("Finance Manager approved customer order " + selectedOrd->orderID);
+                        std::cout << "SUCCESS: Order approved. Stock deducted, corporate funds updated, items granted." << std::endl;
+                        generateCustomerReceipt(*selectedOrd, currentCustName);
+                        saveOrdersCSV(state);
+                        saveProductsCSV(state);
+                        saveCustomersCSV(state);
+                        generateOrdersReport(state);
+                    }
+                    else {
+                        std::cout << "Failed: Insufficient warehouse stock to fulfill this order. Auto-rejecting." << std::endl;
+                        selectedOrd->isRejected = true;
+                        saveOrdersCSV(state);
+                    }
+                }
+                else if (action == 2) {
+                    selectedOrd->isRejected = true;
+                    state.systemLogs.recordAction("Finance Manager rejected customer order " + selectedOrd->orderID);
+                    std::cout << "Order successfully rejected." << std::endl;
+                    saveOrdersCSV(state);
+                }
+            }
+            else if (finChoice == 5) {
+                std::cout << "\n--- WARRANTY CLAIMS QUEUE ---" << std::endl;
+                bool found = false;
+                for (const auto& cl : state.warrantyClaims) {
+                    if (!cl.isProcessed) {
+                        std::cout << "  * Claim ID: " << cl.claimID
+                            << " | Customer ID: " << cl.customerID
+                            << " | Product ID: " << cl.productID
+                            << " | Type: " << cl.claimType
+                            << " | Refund Value: $" << cl.refundAmount << std::endl;
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    std::cout << "  No pending warranty claims found." << std::endl;
+                    continue;
+                }
+                std::cout << "Enter Claim ID to process: ";
+                std::string targetClaimID = readString();
+                WarrantyClaim* selectedCl = nullptr;
+                for (auto& cl : state.warrantyClaims) {
+                    if (cl.claimID == targetClaimID && !cl.isProcessed) {
+                        selectedCl = &cl;
+                        break;
+                    }
+                }
+                if (!selectedCl) {
+                    std::cout << "Invalid or already processed Claim ID." << std::endl;
+                    continue;
+                }
+                if (selectedCl->claimType == "Replacement") {
+                    Product* p = state.globalWarehouse.findProductByID(selectedCl->productID);
+                    if (p && p->getQuantity() >= 1) {
+                        p->setQuantity(p->getQuantity() - 1);
+                        selectedCl->isProcessed = true;
+                        state.systemLogs.recordAction("Approved warranty claim replacement " + selectedCl->claimID);
+                        std::cout << "SUCCESS: Replacement item approved and deducted from warehouse stock." << std::endl;
+                        saveWarrantyClaimsCSV(state);
+                        saveProductsCSV(state);
+                        generateOrdersReport(state);
+                    }
+                    else {
+                        std::cout << "Failed: Product is out of stock. Suggest a refund instead." << std::endl;
+                    }
+                }
+                else if (selectedCl->claimType == "Refund") {
+                    if (state.availableCapital >= selectedCl->refundAmount) {
+                        state.availableCapital -= selectedCl->refundAmount;
+                        state.totalOperatingExpenses += selectedCl->refundAmount;
+                        selectedCl->isProcessed = true;
+                        state.systemLogs.recordAction("Approved warranty claim refund " + selectedCl->claimID);
+                        std::cout << "SUCCESS: Refund approved. $" << selectedCl->refundAmount << " paid from capital." << std::endl;
+                        saveWarrantyClaimsCSV(state);
+                        generateOrdersReport(state);
+                    }
+                    else {
+                        std::cout << "Failed: Insufficient corporate capital to issue refund." << std::endl;
+                    }
+                }
+            }
+            else if (finChoice == 6) {
+                generateFinanceExcel(state);
+            }
+            else if (finChoice == 7) {
+                finance->generateReport();
+            }
+        }
+    }
+}
+
+void runCustomerPortal(SystemState& state) {
+    std::cout << "=== CLIENT PORTAL ===" << std::endl;
+    std::cout << "1. Sign In (Registered Customer)" << std::endl;
+    std::cout << "2. Sign Up (New Registration)" << std::endl;
+    std::cout << "Choice: ";
+    int custPortalSel = readInt();
+
+    Customer* activeCust = nullptr;
+    if (custPortalSel == 1) {
+        std::cout << "Enter Customer ID: ";
+        std::string cID = readString();
+        for (auto& cust : state.customers) {
+            if (cust.getCustomerID() == cID) {
+                activeCust = &cust;
+                break;
+            }
+        }
+        if (!activeCust) {
+            std::cout << "ID not verified in staff system directories.\n" << std::endl;
+            return;
+        }
+    }
+    else if (custPortalSel == 2) {
+        std::cout << "Enter Unique Customer ID: ";
+        std::string cID = readValidID();
+        while (isCustomerIDDuplicate(state, cID)) {
+            std::cout << "Error: Customer ID already registered. Use a unique ID: ";
+            cID = readValidID();
+        }
+        std::cout << "Enter Your Name (Alphabets Only): ";
+        std::string cName = readAlphaString();
+        std::string cContact = readContactInfo();
+        state.customers.push_back(Customer(cID, cName, cContact));
+        activeCust = &state.customers.back();
+        std::cout << "Registration successful! Welcome " << cName << "!\n";
+        saveCustomersCSV(state);
+    }
+    else {
+        return;
+    }
+
+    while (true) {
+        std::cout << "\n=== WELCOME TO THE SHOPPING MENU ===" << std::endl;
+        std::cout << "1. Browse Store Products" << std::endl;
+        std::cout << "2. Purchase Item (Submits pending order)" << std::endl;
+        std::cout << "3. View My Purchases Trail" << std::endl;
+        std::cout << "4. File Warranty Claim (Replace or Refund)" << std::endl;
+        std::cout << "5. Logout" << std::endl;
+        std::cout << "Choice: ";
+        int shopChoice = readInt();
+        if (shopChoice == 5) break;
+
+        if (shopChoice == 1) {
+            std::cout << "\n--- BROWSE CATALOG ---" << std::endl;
+            std::cout << state.globalWarehouse;
+        }
+        else if (shopChoice == 2) {
+            std::cout << "Enter the Product ID you wish to purchase: ";
+            std::string targetID = readString();
+            Product* item = state.globalWarehouse.findProductByID(targetID);
+
+            if (!item) {
+                std::cout << "Error: Product ID does not exist in store." << std::endl;
+            }
+            else {
+                if (item->getSubtype() == "VegFruit") {
+                    std::cout << "This Veg/Fruit item is sold by weight ($" << item->getPrice() << "/kg).\n";
+                    std::cout << "Select purchase unit:\n  1. Kilograms (kg)\n  2. Grams (g)\nChoice: ";
+                    int unitSel = readInt();
+                    double targetGrams = 0.0;
+                    double calculatedCost = 0.0;
+                    if (unitSel == 1) {
+                        std::cout << "Enter weight in Kilograms (e.g. 1.5): ";
+                        double kgVal = readDouble();
+                        targetGrams = kgVal * 1000.0;
+                        calculatedCost = item->getPrice() * kgVal;
+                    }
+                    else {
+                        std::cout << "Enter weight in Grams (e.g. 450): ";
+                        double gVal = readDouble();
+                        targetGrams = gVal;
+                        calculatedCost = (item->getPrice() / 1000.0) * gVal;
+                    }
+                    int orderQtyGrams = static_cast<int>(targetGrams);
+                    if (item->getQuantity() >= orderQtyGrams) {
+                        CustomerOrder ord;
+                        std::ostringstream ordID;
+                        ordID << "CUST-ORD-" << state.pendingOrders.size() + 100;
+                        ord.orderID = ordID.str();
+                        ord.customerID = activeCust->getCustomerID();
+                        ord.productID = targetID;
+                        ord.quantity = orderQtyGrams;
+                        ord.totalPrice = calculatedCost;
+                        ord.isApproved = false;
+                        ord.isRejected = false;
+                        state.pendingOrders.push_back(ord);
+                        state.systemLogs.recordAction("Customer " + activeCust->getCustomerName() + " submitted pending Veg/Fruit order " + ord.orderID);
+                        std::cout << "[Order Received] Order " << ord.orderID << " submitted successfully.\n"
+                            << "  -> Weight requested: " << (targetGrams / 1000.0) << " kg | Total: $" << calculatedCost << std::endl;
+                        saveOrdersCSV(state);
+                    }
+                    else {
+                        double currentKgAvailable = static_cast<double>(item->getQuantity()) / 1000.0;
+                        std::cout << "[Failed] Insufficient stock. Only " << currentKgAvailable << " kg available." << std::endl;
+                    }
+                }
+                else {
+                    std::cout << "Product: " << item->getProductName() << " | Price: $" << item->getPrice() << std::endl;
+                    std::cout << "Enter quantity: ";
+                    int orderQty = readInt();
+                    if (item->getQuantity() >= orderQty) {
+                        CustomerOrder ord;
+                        std::ostringstream ordID;
+                        ordID << "CUST-ORD-" << state.pendingOrders.size() + 100;
+                        ord.orderID = ordID.str();
+                        ord.customerID = activeCust->getCustomerID();
+                        ord.productID = targetID;
+                        ord.quantity = orderQty;
+                        ord.totalPrice = item->getPrice() * orderQty;
+                        ord.isApproved = false;
+                        ord.isRejected = false;
+                        state.pendingOrders.push_back(ord);
+                        state.systemLogs.recordAction("Customer " + activeCust->getCustomerName() + " submitted pending order " + ord.orderID);
+                        std::cout << "[Order Received] Order " << ord.orderID << " submitted successfully.\n"
+                            << "  -> Awaiting Finance Manager approval. Stock is not yet deducted." << std::endl;
+                        saveOrdersCSV(state);
+                    }
+                    else {
+                        std::cout << "[Failed] Insufficient stock. Only " << item->getQuantity() << " available." << std::endl;
+                    }
+                }
+            }
+        }
+        else if (shopChoice == 3) {
+            activeCust->viewPurchaseHistory();
+            std::cout << "Total Spent: $" << activeCust->getTotalSpent() << std::endl;
+        }
+        else if (shopChoice == 4) {
+            std::cout << "\n--- FILE WARRANTY CLAIM ---" << std::endl;
+            const auto& purchases = activeCust->getPurchasedItems();
+            if (purchases.empty()) {
+                std::cout << "You have no approved purchases eligible for warranty claims." << std::endl;
+                continue;
+            }
+            std::cout << "Eligible Purchases:\n";
+            for (size_t i = 0; i < purchases.size(); ++i) {
+                std::cout << "  [" << i + 1 << "] " << purchases[i].productName
+                    << " (ID: " << purchases[i].productID
+                    << ") | Purchased: " << purchases[i].purchaseDate
+                    << " | Warranty: " << purchases[i].warrantyMonths << " Months" << std::endl;
+            }
+            std::cout << "Select item to claim (Index): ";
+            int idx = readInt();
+            if (idx < 1 || idx > static_cast<int>(purchases.size())) {
+                std::cout << "Invalid index selection." << std::endl;
+                continue;
+            }
+            const auto& selected = purchases[idx - 1];
+            if (selected.warrantyMonths == 0) {
+                std::cout << "This product does not have an active warranty." << std::endl;
+                continue;
+            }
+            std::string today = getCurrentDateTime().substr(0, 10);
+            std::string warrantyEndDate = addMonthsToDate(selected.purchaseDate, selected.warrantyMonths);
+            if (today > warrantyEndDate) {
+                std::cout << "Warranty expired. (Valid until: " << warrantyEndDate << " | Today: " << today << ")" << std::endl;
+                continue;
+            }
+            std::cout << "Warranty is VALID until: " << warrantyEndDate << std::endl;
+            std::cout << "Select Option:\n  1. Replacement product\n  2. Refund (Money Back)\nChoice: ";
+            int claimSel = readInt();
+            if (claimSel != 1 && claimSel != 2) {
+                std::cout << "Invalid selection." << std::endl;
+                continue;
+            }
+            WarrantyClaim claim;
+            std::ostringstream claimID;
+            claimID << "CLAIM-" << state.warrantyClaims.size() + 100;
+            claim.claimID = claimID.str();
+            claim.customerID = activeCust->getCustomerID();
+            claim.productID = selected.productID;
+            claim.claimType = (claimSel == 1) ? "Replacement" : "Refund";
+            claim.refundAmount = selected.pricePaid;
+            claim.isProcessed = false;
+            state.warrantyClaims.push_back(claim);
+            state.systemLogs.recordAction("Customer " + activeCust->getCustomerName() + " filed warranty claim " + claim.claimID);
+            std::cout << "SUCCESS: Warranty claim " << claim.claimID << " submitted. Awaiting Finance Manager review." << std::endl;
+            saveWarrantyClaimsCSV(state);
+        }
+    }
+}
+
+void runSupplierPortal(SystemState& state) {
+    std::cout << "Enter Supplier ID to Access Dashboard: ";
+    std::string sID = readString();
+    Supplier* activeSup = nullptr;
+    for (auto& sup : state.suppliers) {
+        if (sup.getSupplierID() == sID) {
+            activeSup = &sup;
+            break;
+        }
+    }
+    if (!activeSup) {
+        std::cout << "Supplier ID not recognized. Ask Admin to register this supplier.\n" << std::endl;
+        return;
+    }
+
+    while (true) {
+        std::cout << "\n=== SUPPLIER DASHBOARD: " << activeSup->getSupplierName() << " ===" << std::endl;
+        std::cout << "1. View Pending Deliveries" << std::endl;
+        std::cout << "2. Fulfill Pending Delivery Order" << std::endl;
+        std::cout << "3. View Contract Terms & Invoice Summary" << std::endl;
+        std::cout << "4. Logout" << std::endl;
+        std::cout << "Choice: ";
+        int supChoice = readInt();
+        if (supChoice == 4) break;
+
+        if (supChoice == 1) {
+            std::cout << "\n--- PENDING DELIVERY SLOTS ---" << std::endl;
+            bool found = false;
+            for (const auto& req : state.restockRequests) {
+                if (req.supplierID == activeSup->getSupplierID() && !req.isFulfilled) {
+                    std::cout << "  * Order ID: " << req.orderID
+                        << " | Product ID: " << req.productID
+                        << " | Quantity Requested: " << req.quantityRequested << std::endl;
+                    found = true;
+                }
+            }
+            if (!found) {
+                std::cout << "  No pending requests assigned from depot managers." << std::endl;
+            }
+        }
+        else if (supChoice == 2) {
+            std::cout << "Enter the Pending Order ID you wish to fulfill: ";
+            std::string ordID = readString();
+            int targetIdx = -1;
+            for (size_t i = 0; i < state.restockRequests.size(); ++i) {
+                if (state.restockRequests[i].orderID == ordID &&
+                    state.restockRequests[i].supplierID == activeSup->getSupplierID() &&
+                    !state.restockRequests[i].isFulfilled) {
+                    targetIdx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (targetIdx == -1) {
+                std::cout << "Active, unfulfilled Order ID matching criteria not located." << std::endl;
+            }
+            else {
+                Product* p = state.globalWarehouse.findProductByID(state.restockRequests[targetIdx].productID);
+                if (p) {
+                    activeSup->orderRestock(*p, state.restockRequests[targetIdx].quantityRequested);
+                    state.restockRequests[targetIdx].isFulfilled = true;
+                    state.systemLogs.recordAction("Fulfilled Restock Order: " + ordID);
+                    std::cout << "Delivery completed. Products updated inside warehouse stock." << std::endl;
+                    saveRestockRequestsCSV(state);
+                    saveProductsCSV(state);
+                }
+                else {
+                    std::cout << "Product ID mapping missing in active warehouse slots." << std::endl;
+                }
+            }
+        }
+        else if (supChoice == 3) {
+            std::cout << activeSup->generateInvoice() << std::endl;
+        }
+    }
+}
+
+// ==========================================
+// MAIN LOOP ENGINE
+// ==========================================
+int main() {
+    checkOrRegisterAdmin();
+
+    SystemState state;
+    loadAllCSVFiles(state);
+
+    while (true) {
+        std::cout << "==========================================" << std::endl;
+        std::cout << "        INVENTORY SYSTEM PORTAL           " << std::endl;
+        std::cout << "==========================================" << std::endl;
+        std::cout << "1. Administrator Portal" << std::endl;
+        std::cout << "2. Employee Portal (StockKeeper / Manager)" << std::endl;
+        std::cout << "3. Customer checkout Portal" << std::endl;
+        std::cout << "4. Supplier Fulfilment Portal" << std::endl;
+        std::cout << "5. Exit Application" << std::endl;
+        std::cout << "Select Portal Access (1-5): ";
+
+        int mainSel = readInt();
+        if (mainSel == 5) {
+            saveAllCSVFiles(state);
+            std::cout << "Exiting application. All changes successfully written to disk." << std::endl;
+            break;
+        }
+
+        if (mainSel == 1) {
+            runAdminPortal(state);
+        }
+        else if (mainSel == 2) {
+            runEmployeePortal(state);
+        }
+        else if (mainSel == 3) {
+            runCustomerPortal(state);
+        }
+        else if (mainSel == 4) {
+            runSupplierPortal(state);
+        }
+    }
+
+    return 0;
+}
